@@ -147,10 +147,19 @@ pub(crate) fn caps() -> &'static Caps {
 /// dropping dots/dashes and case folds the spelling variants ("H265", "E-AC3") onto one key
 /// so a firmware's formatting choice cannot un-recognize a codec.
 fn canon(name: &str) -> String {
-    name.chars()
+    let key = name
+        .chars()
         .filter(|c| !matches!(c, '.' | '-'))
         .collect::<String>()
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    // The table names the DTS family after the format ("DTS", on some firmwares "DTS-HD" /
+    // "DTSHD"); PMS's codec id for every DTS flavour is `dca`, which is the spelling
+    // [`crate::plex::DP_AUDIO_CODECS`] carries and the intersection below compares against.
+    if key.starts_with("dts") {
+        "dca".to_string()
+    } else {
+        key
+    }
 }
 
 /// Per-axis conservative merge: min of the nonzero values, 0 (= the row didn't say) only when
@@ -427,9 +436,10 @@ mod tests {
         // a fractional cap is a CEILING the stream must fit under: 59.94 reads as 60, never 59
         let frac = parse(r#"{"videoCodecs":[{"name":"H.264","maxWidth":1920,"maxHeight":1088,"maxFrameRate":59.94}]}"#).unwrap();
         assert_eq!(frac.h264_row, (1920, 1088, 60));
-        // DTS/FLAC/MPEG are in the table but not in the pipeline's decode set; the subset keeps
-        // DP_AUDIO_CODECS's own order, not the table's.
-        assert_eq!(c.audio, "aac,ac3,eac3");
+        // FLAC/MPEG are in the table but not in the pipeline's decode set; DTS is (the table's
+        // "DTS" row folds onto PMS's `dca`); the subset keeps DP_AUDIO_CODECS's own order, not
+        // the table's.
+        assert_eq!(c.audio, "aac,ac3,eac3,dca");
     }
 
     /// The merge is per-AXIS min, not a pick of the smaller row: a table whose duplicate rows
@@ -539,10 +549,25 @@ mod tests {
     fn an_empty_audio_intersection_falls_back_to_the_full_dp_set() {
         let c = parse(
             r#"{"videoCodecs":[{"name":"H.264","maxWidth":1920,"maxHeight":1088}],
-                "audioCodecs":[{"name":"DTS"},{"name":"WMA"}]}"#,
+                "audioCodecs":[{"name":"MP3"},{"name":"WMA"}]}"#,
         )
         .unwrap();
         assert_eq!(c.audio, crate::plex::DP_AUDIO_CODECS);
+    }
+
+    /// The table names the format ("DTS", "DTS-HD"); PMS names the codec (`dca`). A table that
+    /// lists only DTS yields exactly the one direct-playable codec, under PMS's spelling.
+    #[test]
+    fn the_tables_dts_row_folds_onto_pmss_dca() {
+        for row in ["DTS", "DTS-HD", "dts"] {
+            let c = parse(&format!(
+                r#"{{"videoCodecs":[{{"name":"H.264","maxWidth":1920,"maxHeight":1088}}],
+                    "audioCodecs":[{{"name":"{row}"}}]}}"#
+            ))
+            .unwrap();
+            assert_eq!(c.audio, "dca", "{row}");
+            assert!(c.audio_has("dca"));
+        }
     }
 
     /// The fallback IS yesterday's constants — the values the app asserted for every device
@@ -553,6 +578,6 @@ mod tests {
         let c = Caps::assumed();
         assert!(c.hevc);
         assert_eq!(c.hevc_max, (3840, 2176));
-        assert_eq!(c.audio, "aac,ac3,eac3");
+        assert_eq!(c.audio, "aac,ac3,eac3,dca");
     }
 }

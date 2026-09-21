@@ -150,6 +150,9 @@ libc = "0.2"
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 # derive(Deserialize) for the typed plex API response models (src/plex/models.rs)
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# Dolby Vision RPU parse/rewrite (quietvoid's dovi_tool library, MIT): the in-app Profile 7 -> 8.1
+# conversion in ff.rs. Pure Rust; the RPU API needs none of the optional (xml/serde/capi) features.
+dolby_vision = { version = "3.4", default-features = false }
 
 [profile.release]
 opt-level = 2

@@ -25,9 +25,21 @@ use super::probe::Location;
 /// [`is_dp_audio`] predicate that gates every direct-play decision (route + the track menu's
 /// native-switch) and the profile string's audio lists BOTH read the caps snapshot, so the
 /// claim sent to PMS and the gate applied locally cannot drift apart.
-pub const DP_AUDIO_CODECS: &str = "aac,ac3,eac3";
+pub const DP_AUDIO_CODECS: &str = "aac,ac3,eac3,dca";
 pub fn is_dp_audio(codec: &str) -> bool {
-    crate::devcaps::caps().audio_has(codec)
+    crate::devcaps::caps().audio_has(dp_audio_key(codec))
+}
+
+/// PMS spells the DTS family several ways — `dca` on a stream (libavcodec's old decoder name),
+/// `dts` in some records, `dca-ma` / `dca-hra` on a Media whose track is DTS-HD — and the pipeline
+/// decodes every one of them with the one DTS decoder its codec table lists, so all of them fold
+/// onto the `dca` that [`DP_AUDIO_CODECS`] carries. Anything else passes through unchanged.
+pub fn dp_audio_key(codec: &str) -> &str {
+    if codec == "dts" || codec.starts_with("dca-") {
+        "dca"
+    } else {
+        codec
+    }
 }
 
 // ---- the relay policy: what the LINK to a server allows a plan to ask for -------------------
@@ -976,6 +988,13 @@ mod tests {
         assert_eq!(video.first().map(String::as_str), Some("hevc"),
             "hevc must stay FIRST: order is preference, and hevc is what keeps 4K+HDR10 through a re-encode");
         for c in super::DP_AUDIO_CODECS.split(',') {
+            if c == "dca" {
+                // DTS is decoded natively but is never an ENCODE target: a DTS source is copied
+                // when the pipeline can take it and re-encoded to the chain's head when it cannot.
+                assert!(!list_of(target, "audioCodec=").contains(&c.to_string()),
+                    "dca must not be an encode target");
+                continue;
+            }
             assert!(list_of(target, "audioCodec=").contains(&c.to_string()),
                 "{c} is direct-playable but absent from the target — the server would re-encode a track we decode natively");
         }
@@ -1059,7 +1078,7 @@ mod tests {
         assert_eq!(
             super::profile_for(&Caps::assumed()),
             "add-direct-play-profile(type=videoProfile&container=mkv,mp4&videoCodec=h264,hevc\
-             &audioCodec=aac,ac3,eac3&subtitleCodec=srt,subrip,ass,ssa)\
+             &audioCodec=aac,ac3,eac3,dca&subtitleCodec=srt,subrip,ass,ssa)\
              +add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.width&value=3840&replace=true)\
              +add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.height&value=2176&replace=true)\
              +add-limitation(scope=videoCodec&scopeName=*&type=upperBound&name=video.bitDepth&value=10&replace=true)\

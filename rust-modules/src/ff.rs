@@ -653,6 +653,16 @@ unsafe fn audio_stream_matching(fmt: *mut AVFormatContext, want: &str) -> Option
     if want.is_empty() {
         return None;
     }
+    // PMS spells DTS `dca` (libavcodec's OLD name for the decoder; `dca-ma` on a Media whose
+    // track is DTS-HD MA), the bundled FFmpeg's `avcodec_get_name` says `dts`. Same track, two
+    // spellings — fold the payload's onto FFmpeg's, or a DTS direct play would never find its
+    // own audio and fall to `av_find_best_stream`.
+    let lower = want.to_ascii_lowercase();
+    let want = if lower == "dca" || lower.starts_with("dca-") {
+        "dts"
+    } else {
+        want
+    };
     let streams = (*fmt).streams;
     for i in 0..(*fmt).nb_streams {
         let cp = stream_codecpar(*streams.add(i as usize));
@@ -2532,6 +2542,36 @@ unsafe fn parse_extradata(ed: *const u8, len: usize, is_hevc: bool) -> (Vec<u8>,
 }
 
 static SEI_STRIPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static EL_DROPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static RPU_REWRITTEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static RPU_FAILED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// `nuh_layer_id` of an HEVC NAL (`nal` starts at the 2-byte NAL header): bit 0 of byte 0 is the
+/// high bit, the top five bits of byte 1 the rest. A single-layer stream is layer 0 throughout; a
+/// Dolby Vision Profile 7 file carries its enhancement layer as layer 1, interleaved in the SAME
+/// track (that is how MakeMKV-style remuxes store BL+EL+RPU), which is what makes the drop below
+/// possible from one demuxer.
+fn hevc_layer_id(nal: &[u8]) -> u8 {
+    if nal.len() < 2 {
+        return 0;
+    }
+    ((nal[0] & 1) << 5) | (nal[1] >> 3)
+}
+
+/// Rewrite a Dolby Vision RPU NAL (HEVC UNSPEC62; `nal` = 2-byte header + payload, emulation-
+/// prevention bytes still in place) from **Profile 7 to Profile 8.1** — the conversion
+/// `dovi_tool -m 2` performs, producing the single-layer shape this app already declares and
+/// direct-plays. An RPU that is not Profile 7 comes back unchanged. `None` means the RPU could not
+/// be parsed or converted; the caller DROPS it, because a frame without an RPU falls back to the
+/// previous dynamic metadata, which is far better than handing a Profile 8 declaration a P7 RPU.
+fn rewrite_rpu_p7_to_p81(nal: &[u8]) -> Option<Vec<u8>> {
+    let mut rpu = dolby_vision::rpu::dovi_rpu::DoviRpu::parse_unspec62_nalu(nal).ok()?;
+    if rpu.dovi_profile != 7 {
+        return Some(nal.to_vec());
+    }
+    rpu.convert_with_mode(dolby_vision::rpu::ConversionMode::To81).ok()?;
+    rpu.write_hevc_unspec62_nalu().ok()
+}
 
 /// True if this HEVC NAL is an SEI (prefix=39 / suffix=40) carrying a user-data-registered
 /// ITU-T T.35 HDR10+ dynamic-metadata message (payloadType 4, country_code 0xB5, terminal
@@ -2586,11 +2626,17 @@ fn nal_end(i: usize, nl: usize, size: usize) -> Option<usize> {
 /// Convert one length-prefixed video packet to Annex-B (4-byte start codes) into `out`,
 /// prepending `param` (VPS/SPS/PPS) when the AU is a keyframe (H264 IDR type 5 / HEVC IRAP
 /// types 16-23). Returns true if it is a keyframe. Mirrors mkv_handle_block.
+///
+/// `dv_p7` — the stream is a dual-layer Dolby Vision **Profile 7** being converted to 8.1 on the
+/// way to the pipeline: every enhancement-layer NAL (`nuh_layer_id` > 0) is dropped and every
+/// RPU NAL (type 62) is rewritten by [`rewrite_rpu_p7_to_p81`], so what leaves here is the
+/// single-layer stream the Load payload declares (`DolbyHdrInfo profileId 8`).
 unsafe fn packet_to_annexb(
     data: *const u8,
     size: usize,
     nls: usize,
     is_hevc: bool,
+    dv_p7: bool,
     param: &[u8],
     out: &mut Vec<u8>,
 ) -> bool {
@@ -2639,6 +2685,45 @@ unsafe fn packet_to_annexb(
             break;
         };
         let nal = &d[i..end];
+        if is_hevc && dv_p7 {
+            // Profile 7 -> 8.1, in-app: the enhancement layer never reaches the pipeline, and each
+            // RPU is rewritten so the dynamic metadata describes the single layer that does.
+            if hevc_layer_id(nal) > 0 {
+                let n = EL_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 3 || n % 5000 == 0 {
+                    crate::player::log(&format!(
+                        "ff: dropped DV enhancement-layer NAL #{n} ({nl} bytes)"
+                    ));
+                }
+                i += nl;
+                continue;
+            }
+            if nal.len() >= 2 && ((nal[0] >> 1) & 0x3f) == 62 {
+                match rewrite_rpu_p7_to_p81(nal) {
+                    Some(rpu) => {
+                        let n = RPU_REWRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 3 || n % 5000 == 0 {
+                            crate::player::log(&format!(
+                                "ff: rewrote DV RPU #{n} P7 -> P8.1 ({nl} -> {} bytes)",
+                                rpu.len()
+                            ));
+                        }
+                        out.extend_from_slice(&sc);
+                        out.extend_from_slice(&rpu);
+                    }
+                    None => {
+                        let n = RPU_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 3 || n % 500 == 0 {
+                            crate::player::log(&format!(
+                                "ff: DV RPU #{n} could not be converted — dropped ({nl} bytes)"
+                            ));
+                        }
+                    }
+                }
+                i += nl;
+                continue;
+            }
+        }
         if is_hevc && is_hdr10plus_sei(nal) {
             let n = SEI_STRIPPED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 3 || n % 500 == 0 {
@@ -7171,6 +7256,19 @@ pub(crate) fn demux(
                 // parameter sets on this 3.3 build (it leaves the keyframe starting with SEI), so we
                 // build the AU from the codecpar extradata; libavformat still owns demux + seeking.
                 let is_hevc = (*vcp).codec_id == AV_CODEC_ID_HEVC;
+                // Dolby Vision Profile 7 (dual-layer) is converted to Profile 8.1 while feeding —
+                // `packet_to_annexb` drops the enhancement layer and rewrites the RPUs — so the
+                // pipeline is handed the single-layer shape the Load payload declares
+                // (`DolbyHdrInfo profileId 8`, see `metadata::Dovi::converts_to_p81`).
+                // `/tmp/plxnative-p7raw` feeds the dual layer untouched instead, for an A/B.
+                let dv_p7 = is_hevc
+                    && dovi_conf(vcp).is_some_and(|d| d.dv_profile == 7 && d.el_present_flag != 0)
+                    && !crate::metadata::dv_p7_raw();
+                if dv_p7 {
+                    crate::player::log(
+                        "ff: Dolby Vision P7 -> P8.1 conversion armed (EL dropped, RPUs rewritten)",
+                    );
+                }
                 let (param_blob, nal_len_size) = parse_extradata(
                     (*vcp).extradata,
                     (*vcp).extradata_size.max(0) as usize,
@@ -7263,6 +7361,7 @@ pub(crate) fn demux(
                             (*pkt).size.max(0) as usize,
                             nal_len_size,
                             is_hevc,
+                            dv_p7,
                             &param_blob,
                             &mut aubuf,
                         );
@@ -7662,7 +7761,7 @@ mod tests {
 
     fn to_annexb(buf: &[u8], is_hevc: bool, param: &[u8]) -> (bool, Vec<u8>) {
         let mut out = Vec::new();
-        let key = unsafe { packet_to_annexb(buf.as_ptr(), buf.len(), 4, is_hevc, param, &mut out) };
+        let key = unsafe { packet_to_annexb(buf.as_ptr(), buf.len(), 4, is_hevc, false, param, &mut out) };
         (key, out)
     }
 

@@ -204,7 +204,28 @@ impl Dovi {
         if !self.present {
             return false;
         }
+        if self.converts_to_p81() {
+            // The feed path turns this dual layer into a real Profile 8.1 stream (`ff.rs`'s
+            // `packet_to_annexb` drops the EL and rewrites the RPUs), and 8.1's base layer is the
+            // HDR10 picture it always was — so nothing about it is unusable, and a copy of it is a
+            // copy of a displayable stream.
+            return false;
+        }
         self.el_present || self.profile == 5 || (self.profile > 0 && self.bl_compat == 0)
+    }
+
+    /// PURE: a **Profile 7 the feed path converts to Profile 8.1** — dual-layer (`el_present`)
+    /// with a cross-compatible base layer (`bl_compat != 0`; a UHD Blu-ray remux reports 6, the
+    /// only value the Dolby profile table assigns to profile 7). The conversion is the one
+    /// `dovi_tool -m 2` performs: enhancement-layer NALs dropped, each RPU rewritten to 8.1 with
+    /// no-op mapping. The enhancement layer only ever mattered to a disc player; every panel this
+    /// app has been measured on ignores it and shows the base layer plus the RPU — which is
+    /// exactly what a Profile 8.1 stream is.
+    ///
+    /// Profile 5 is untouched by this (no EL, `bl_compat` 0), and so is a Profile 7 whose base
+    /// layer is not cross-compatible — that one is still refused as `dual-layer`.
+    pub(crate) fn converts_to_p81(&self) -> bool {
+        self.present && self.el_present && self.profile == 7 && self.bl_compat != 0
     }
 
     /// PURE: **how this stream will be presented** — the ONE predicate behind both halves of the
@@ -250,7 +271,9 @@ impl Dovi {
         if !self.present {
             return DvPresentation::NotDv;
         }
-        if self.el_present {
+        // A convertible Profile 7 falls THROUGH to the declare arm below, as the 8.1 the feed
+        // path really produces; only a dual layer we cannot convert is still refused here.
+        if self.el_present && !self.converts_to_p81() {
             return DvPresentation::Refuse("dual-layer");
         }
         // **Whether a node will be sent, and the trigger is no longer the whole answer.** A
@@ -279,11 +302,21 @@ impl Dovi {
             };
         }
         DvPresentation::Declare(DolbyHdrInfo {
-            profile_id: self.profile,
+            // A converted Profile 7 declares what is actually fed: 8.1, one layer.
+            profile_id: if self.converts_to_p81() {
+                8
+            } else {
+                self.profile
+            },
             // Honest derivation, and unreachable as `"dual"` while the `el_present` arm above
-            // returns first — written this way so that the day an interleaver exists, the payload
-            // follows the refusal being relaxed instead of quietly lying about the track.
-            track_type: if self.el_present { "dual" } else { "single" },
+            // returns first for every dual layer we do not convert — written this way so that the
+            // day an interleaver exists, the payload follows the refusal being relaxed instead of
+            // quietly lying about the track.
+            track_type: if self.el_present && !self.converts_to_p81() {
+                "dual"
+            } else {
+                "single"
+            },
             // Never `"all"`: paired with `trackType: "dual"` that is what sets `dv-dual-svp`, the
             // secure-video-path flag, which this app cannot satisfy.
             encryption_type: "clear",
@@ -293,6 +326,15 @@ impl Dovi {
     /// [`presentation`](Self::presentation) with the trigger read for you — the form both real
     /// call sites use, so the gate and the payload are answered from one latched bool.
     pub(crate) fn presentation_now(&self) -> DvPresentation {
+        if self.converts_to_p81() && dv_p7_raw() {
+            // `/tmp/plxnative-p7raw`: the feed path leaves the dual layer untouched, so declare
+            // what is really being fed — Profile 7, in the one track it arrives in.
+            return DvPresentation::Declare(DolbyHdrInfo {
+                profile_id: 7,
+                track_type: "single",
+                encryption_type: "clear",
+            });
+        }
         self.presentation(!dv_withheld())
     }
 }
@@ -400,6 +442,15 @@ crate::dev::latched_flag!(
     /// between cases, so an unlatched read could legitimately answer differently at the route
     /// decision and at the Load a few frames later, and direct-play a Profile 5 with no node.
     pub(crate) fn dv_withheld = "nodv";
+);
+
+crate::dev::latched_flag!(
+    /// `/tmp/plxnative-p7raw` — feed a Dolby Vision **Profile 7** file's dual layer UNCONVERTED
+    /// (no enhancement-layer drop, no RPU rewrite) and declare `profileId:7`, for an A/B against
+    /// the in-app Profile 7 -> 8.1 conversion that is the shipping default. Read in two places
+    /// that must agree — [`Dovi::presentation_now`] (the payload's profile id) and `ff.rs`'s feed
+    /// switch — which is why it is latched like the other two.
+    pub(crate) fn dv_p7_raw = "p7raw";
 );
 
 // `Default` is for TESTS: every field is a zero/empty that means "PMS did not say", so a fixture

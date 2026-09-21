@@ -9886,8 +9886,16 @@ mod tests {
 
     #[test]
     fn no_direct_playable_track_means_transcode() {
-        let tracks = [trk(1, "truehd", "eng", true), trk(2, "dts", "eng", false)];
+        let tracks = [trk(1, "truehd", "eng", true), trk(2, "flac", "eng", false)];
         assert!(pick_dp_audio(&tracks, "truehd").is_none());
+    }
+
+    #[test]
+    fn a_dts_sibling_is_direct_playable() {
+        // DTS (`dca`, spelled `dts` by some records) is in the pipeline's decode set now, so a
+        // TrueHD default with a DTS sibling smart-direct-plays the sibling instead of transcoding.
+        let tracks = [trk(1, "truehd", "eng", true), trk(2, "dts", "eng", false)];
+        assert_eq!(pick_dp_audio(&tracks, "truehd"), Some((1, "dts".into(), 2)));
     }
 
     // ---- rung 1: the selection the SERVER already holds --------------------------------------
@@ -9927,15 +9935,29 @@ mod tests {
 
     #[test]
     fn a_selected_track_that_cannot_direct_play_falls_through_to_the_ladder() {
-        // A live shape off the server: it holds the English DTS track (a real pick — it is
-        // not the file default), which this pipeline cannot decode. Honouring it would force a
-        // whole-video transcode for one audio track, so the ladder runs on instead.
+        // A real pick (not the file default) the pipeline cannot decode — TrueHD. Honouring it
+        // would force a whole-video transcode for one audio track, so the ladder runs on instead.
+        let tracks = [
+            trk(2663, "ac3", "rus", true),
+            server_selected(trk(2669, "truehd", "eng", false)),
+            trk(2673, "ac3", "eng", false),
+        ];
+        assert_eq!(
+            pick_dp_audio(&tracks, "truehd"),
+            Some((2, "ac3".into(), 2673))
+        );
+    }
+
+    #[test]
+    fn a_selected_dts_track_is_honoured_now_that_dts_direct_plays() {
+        // The live shape off the server that used to fall through: the English DTS track is a
+        // real pick, and DTS is in the decode set now, so rung 1 honours it.
         let tracks = [
             trk(2663, "ac3", "rus", true),
             server_selected(trk(2669, "dca", "eng", false)),
             trk(2673, "ac3", "eng", false),
         ];
-        assert_eq!(pick_dp_audio(&tracks, "dca"), Some((2, "ac3".into(), 2673)));
+        assert_eq!(pick_dp_audio(&tracks, "dca"), Some((1, "dca".into(), 2669)));
     }
 
     /// The whole ladder, rung by rung, with the selected flag switched on and off — the order is
@@ -9971,7 +9993,7 @@ mod tests {
                 "rung 1 is skipped when the pick can't direct-play, not obeyed by transcoding",
                 vec![
                     trk(1, "ac3", "rus", true),
-                    server_selected(trk(2, "dca", "eng", false)),
+                    server_selected(trk(2, "truehd", "eng", false)),
                     trk(3, "ac3", "eng", false),
                 ],
                 "ac3",
@@ -10002,7 +10024,7 @@ mod tests {
                 "nothing direct-playable, selected or not → transcode",
                 vec![
                     server_selected(trk(1, "truehd", "eng", false)),
-                    trk(2, "dts", "rus", true),
+                    trk(2, "flac", "rus", true),
                 ],
                 "truehd",
                 None,
@@ -10177,11 +10199,13 @@ mod tests {
         assert!(!video_direct_plays("hevc", 3840, 1602, dv, &small));
     }
 
-    /// Profile 7 is dual-layer: the picture is split across a base and an enhancement layer, and
-    /// the pipeline feeds ONE elementary stream. Caught by `el_present` alone — the live P7 item
-    /// reports `bl_compat = 6`, so a compatibility-id test would wave it straight through.
+    /// **A convertible Profile 7 direct-plays, declared as the 8.1 the feed path makes of it.**
+    /// The dual layer used to be refused in both worlds because the pipeline is fed ONE
+    /// elementary stream; `ff.rs` now drops the enhancement layer and rewrites the RPUs, so the
+    /// gate and the payload both see a single-layer Profile 8.1 — whatever the trigger says, since
+    /// a cross-compatible base layer declares unconditionally, exactly as P8 does.
     #[test]
-    fn a_dual_layer_profile_7_source_does_not_direct_play() {
+    fn a_convertible_profile_7_source_direct_plays_as_profile_8() {
         let caps = crate::devcaps::Caps {
             hevc: true,
             hevc_max: (4096, 2176),
@@ -10190,26 +10214,43 @@ mod tests {
             vp9: false,
             audio: "eac3".into(),
         };
-        // and it is refused in BOTH worlds: no payload key can hand the pipeline a layer we do
-        // not feed it, so arming the trigger must not open this gate the way it opens P5's
         for signal in [SILENT, DECLARED] {
             let dv = p7().presentation(signal);
             assert!(
-                !video_direct_plays("hevc", 3840, 2160, dv, &caps),
+                video_direct_plays("hevc", 3840, 2160, dv, &caps),
                 "signal={signal}"
             );
-            assert_eq!(dv.refusal(), Some("dual-layer"));
-            assert_eq!(
-                dv.declared(),
-                None,
-                "a layer we cannot feed must never be declared"
-            );
+            assert_eq!(dv.refusal(), None);
+            let n = dv.declared().expect("a converted P7 declares");
+            assert_eq!(n.profile_id, 8, "declared as the 8.1 that is actually fed");
+            assert_eq!(n.track_type, "single");
+            assert_eq!(n.encryption_type, "clear");
         }
+        assert!(p7().converts_to_p81());
+        assert!(
+            !p7().base_layer_unusable(),
+            "a copy of the converted stream is a displayable stream"
+        );
         assert_ne!(
             p7().bl_compat,
             0,
             "the fixture must keep the trap it was built to hold"
         );
+        // A dual layer WITHOUT a cross-compatible base layer is the one still refused, in both
+        // worlds: there is nothing the conversion could leave on screen.
+        let odd = Dovi {
+            bl_compat: 0,
+            ..p7()
+        };
+        for signal in [SILENT, DECLARED] {
+            let dv = odd.presentation(signal);
+            assert!(
+                !video_direct_plays("hevc", 3840, 2160, dv, &caps),
+                "signal={signal}"
+            );
+            assert_eq!(dv.refusal(), Some("dual-layer"));
+            assert_eq!(dv.declared(), None);
+        }
     }
 
     /// **Profile 8.1 must be UNAFFECTED**, and so must every file with no DOVI record at all.
@@ -10381,7 +10422,9 @@ mod tests {
                     assert!(dv.declared().is_some(), "{d:?} signal={signal}");
                 }
                 if let Some(n) = dv.declared() {
-                    assert_eq!(n.profile_id, d.profile);
+                    // a converted Profile 7 declares the 8.1 that is actually fed
+                    let want = if d.converts_to_p81() { 8 } else { d.profile };
+                    assert_eq!(n.profile_id, want, "{d:?}");
                     // `trackType:"dual"` with `encryptionType:"all"` is what sets the pipeline's
                     // `dv-dual-svp` secure-video-path flag, which this app cannot satisfy. No
                     // input may produce that pair.
@@ -10400,7 +10443,8 @@ mod tests {
     #[test]
     fn base_layer_usability_by_profile() {
         assert!(p5().base_layer_unusable());
-        assert!(p7().base_layer_unusable());
+        // convertible: the feed path makes an 8.1 of it, whose base layer is the HDR10 it always was
+        assert!(!p7().base_layer_unusable());
         assert!(!p8().base_layer_unusable());
         assert_eq!(
             p5().presentation(SILENT).refusal(),
