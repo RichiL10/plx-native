@@ -102,6 +102,10 @@ pub(super) const VIDEO_QUEUE_BYTES: u64 = 96 * 1024 * 1024;
 /// prediction to check against is `1600 + 83886080/R_v`, about 25% above every video-bound row of
 /// the current table.
 pub(super) const CENSUS_VIDEO_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
+/// **The audio cap the M4 census was taken at**, 1 MiB, for the same reason: the audio lane is the
+/// binding one at the low rungs (320, 720), so the census reproduction has to run at the audio
+/// size it was measured with, not at the size that ships.
+pub(super) const CENSUS_AUDIO_QUEUE_BYTES: u64 = 1024 * 1024;
 /// Audio AU queue byte cap. `player::engine::AQ_AUDIO_BYTES` = `8 * 1024 * 1024`.
 pub(super) const AUDIO_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
 /// Video feed-ahead throttle. `player::engine::MAX_FEED_AHEAD_NS` = 1.6 s.
@@ -925,6 +929,7 @@ mod tests {
         // the plant moved and the evidence did not.
         let plant = Plant {
             video_queue_bytes: CENSUS_VIDEO_QUEUE_BYTES,
+            audio_queue_bytes: CENSUS_AUDIO_QUEUE_BYTES,
             ..Plant::default()
         };
         let mut checked = 0;
