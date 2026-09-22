@@ -2012,10 +2012,22 @@ pub(crate) fn try_prime(mt: &MainThread, eng: &mut Engine) {
     // demuxer proved audioless may use the video-only escape; `abuf <= 0` alone is starvation, not
     // evidence that no audio exists.
     let audio_expected = SHARED.hls_audio_expected.load(Ordering::Acquire) || playable_abuf > 0;
+    // **A full native sink is a primed decoder.** `pending_video` held with the feeder parked on
+    // BufferFull means Starfish's own source buffer (`srcBufferLevelVideo`, 8 MiB) holds every
+    // byte of video it will take. At a UHD remux's 90-130 Mbit/s that is 0.5-0.75 s -- UNDER
+    // `PRIME_NS` -- and while the clock is held the presented position never moves, so
+    // `accepted_vbuf >= PRIME_NS` can never come true. Measured 2026-09-22 on an LG B4: a viewer's
+    // Resume on an 89.6 Mbit/s Dolby Vision remux logged `queued Resume feeding; physical Play
+    // awaits balanced prime` and then nothing, until a full reload. Waiting for more accepted
+    // video than the sink can hold is waiting for nothing; the audio floor still applies, so the
+    // audioSync master clock never starts on an empty audio lane.
+    let video_sink_full = eng.pending_video.is_some()
+        && SHARED.dg_feed_state.load(Ordering::Relaxed) == 2
+        && accepted_vbuf > 0;
     let decoder_ready = if audio_expected {
-        accepted_vbuf >= PRIME_NS && accepted_abuf >= PRIME_AUDIO_NS
+        (accepted_vbuf >= PRIME_NS || video_sink_full) && accepted_abuf >= PRIME_AUDIO_NS
     } else {
-        accepted_vbuf >= PRIME_VIDEO_MAX_NS
+        accepted_vbuf >= PRIME_VIDEO_MAX_NS || video_sink_full
     };
     let recovery = SHARED.hls_recovery();
     // A downshift has no discretionary trial reserve, yet it can queue candidate AUs while an
@@ -2072,10 +2084,15 @@ pub(crate) fn try_prime(mt: &MainThread, eng: &mut Engine) {
                     ));
                 } else {
                     log(&format!(
-                        "primed: v={}ms a={}ms runway={}ms -> Play",
+                        "primed: v={}ms a={}ms runway={}ms{} -> Play",
                         playable_vbuf / 1_000_000,
                         playable_abuf / 1_000_000,
                         observed_runway_ns / 1_000_000,
+                        if video_sink_full && accepted_vbuf < PRIME_NS {
+                            " (native video sink full below PRIME_NS)"
+                        } else {
+                            ""
+                        },
                     ));
                 }
             }
