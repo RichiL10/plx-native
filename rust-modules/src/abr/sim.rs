@@ -91,7 +91,7 @@ use super::{
 /// because this plant must not depend on the app's own model of itself (see the module note). If
 /// that constant moves, [`tests::the_plant_constants_still_match_the_pipeline`] fails — and it did,
 /// which is how the Phase 0 enlargement reached this file rather than being forgotten in it.
-pub(super) const VIDEO_QUEUE_BYTES: u64 = 10 * 1024 * 1024;
+pub(super) const VIDEO_QUEUE_BYTES: u64 = 96 * 1024 * 1024;
 /// **The video cap the M4 census was taken at**, 8 MiB, and the reason it has to be written down.
 ///
 /// [`tests::the_calibration_reproduces_the_device_census`] grades a MODEL against a MEASUREMENT,
@@ -102,8 +102,8 @@ pub(super) const VIDEO_QUEUE_BYTES: u64 = 10 * 1024 * 1024;
 /// prediction to check against is `1600 + 83886080/R_v`, about 25% above every video-bound row of
 /// the current table.
 pub(super) const CENSUS_VIDEO_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
-/// Audio AU queue byte cap. `player::engine::AQ_AUDIO_BYTES` = `1024 * 1024`.
-pub(super) const AUDIO_QUEUE_BYTES: u64 = 1024 * 1024;
+/// Audio AU queue byte cap. `player::engine::AQ_AUDIO_BYTES` = `8 * 1024 * 1024`.
+pub(super) const AUDIO_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
 /// Video feed-ahead throttle. `player::engine::MAX_FEED_AHEAD_NS` = 1.6 s.
 pub(super) const VIDEO_LEAD_MS: i64 = 1_600;
 /// Audio feed-ahead throttle: `MAX_FEED_AHEAD_NS + AUDIO_SLACK_NS` = 1.6 s + 2.0 s.
@@ -997,19 +997,31 @@ mod tests {
     #[test]
     fn the_lane_ceilings_come_from_elementary_rates() {
         let plant = Plant::default();
-        assert_eq!(plant.b_max_ms(&p20000()), 5_852);
+        // Each lane's ceiling is lead + queue_bits/rate, and the plant answers the SMALLER one.
+        let lane = |lead: i64, bytes: u64, kbps: u32| lead + (bytes * 8 / u64::from(kbps)) as i64;
+        let p = p20000();
         assert_eq!(
-            plant.b_max_ms(&p720()),
-            67_635,
+            plant.b_max_ms(&p),
+            lane(VIDEO_LEAD_MS, VIDEO_QUEUE_BYTES, p.video_es_kbps)
+                .min(lane(AUDIO_LEAD_MS, AUDIO_QUEUE_BYTES, p.audio_es_kbps))
+        );
+        let p = p720();
+        assert_eq!(
+            plant.b_max_ms(&p),
+            lane(VIDEO_LEAD_MS, VIDEO_QUEUE_BYTES, p.video_es_kbps)
+                .min(lane(AUDIO_LEAD_MS, AUDIO_QUEUE_BYTES, p.audio_es_kbps)),
             "the audio lane does not move with the video cap"
         );
         // Forcing the video lane below the audio one flips which ceiling is returned, which is the
         // property `min` has to have and the census alone cannot isolate.
         let video_bound = OperatingPoint {
-            video_es_kbps: 20_000,
+            video_es_kbps: 200_000,
             ..p720()
         };
-        assert_eq!(plant.b_max_ms(&video_bound), 1_600 + 83_886_080 / 20_000);
+        assert_eq!(
+            plant.b_max_ms(&video_bound),
+            VIDEO_LEAD_MS + (VIDEO_QUEUE_BYTES * 8 / 200_000) as i64
+        );
     }
 
     /// MATHEMATICAL INVARIANT: the plant's constants are still the pipeline's.

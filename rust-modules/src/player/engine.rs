@@ -133,8 +133,14 @@ pub(crate) const fn feed_leads_ms() -> (i64, i64) {
 // levers are one decision and neither is worth landing alone.
 // `docs/measurements/p0-plant-sizing.md` is the record; `requiredMemory` is 160 MB, so +2 MiB RSS
 // on a 32-bit set is inside the budget already declared.
-const AQ_VIDEO_BYTES: c_long = 10 * 1024 * 1024;
-const AQ_AUDIO_BYTES: c_long = 1024 * 1024;
+const AQ_VIDEO_BYTES: c_long = 96 * 1024 * 1024;
+const AQ_AUDIO_BYTES: c_long = 8 * 1024 * 1024;
+// **96 MiB / 8 MiB, up from 10 MiB / 1 MiB (2026-09-22).** Sized for a UHD remux over Wi-Fi: at
+// 90 Mbit/s the old video cap held 0.9 s, so with the 1.6 s feed lead the whole reserve was ~2.5 s
+// and every Wi-Fi hiccup longer than that stalled. 96 MiB is ~9 s at 90 Mbit/s (20 s at 40), and
+// the audio lane is kept in the same ratio so a DTS-HD MA track (3.6 Mbit/s) never fills first and
+// blocks the single demux thread while the video lane still has room. The memory is only spent
+// when the link outruns the decoder; `requiredMemory` in appinfo.json moved with it.
 
 pub(crate) struct SampleBuf {
     pub data: Vec<u8>,

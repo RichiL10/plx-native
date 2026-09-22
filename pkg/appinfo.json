@@ -14,5 +14,5 @@
   "nativeLifeCycleInterfaceVersion": 2,
   "handlesRelaunch": false,
   "transparent": true,
-  "requiredMemory": 160
+  "requiredMemory": 280
 }
