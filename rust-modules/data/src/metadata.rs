@@ -499,7 +499,28 @@ impl Dovi {
         if !self.present {
             return false;
         }
+        if self.converts_to_p81() {
+            // The feed path turns this dual layer into a real Profile 8.1 stream (`plx_media`'s
+            // `ff::packet_to_annexb` drops the EL and rewrites the RPUs), and 8.1's base layer is
+            // the HDR10 picture it always was — so nothing about it is unusable, and a copy of it
+            // is a copy of a displayable stream.
+            return false;
+        }
         self.el_present || self.profile == 5 || (self.profile > 0 && self.bl_compat == 0)
+    }
+
+    /// PURE: a **Profile 7 the feed path converts to Profile 8.1** — dual-layer (`el_present`)
+    /// with a cross-compatible base layer (`bl_compat != 0`; a UHD Blu-ray remux reports 6, the
+    /// only value the Dolby profile table assigns to profile 7). The conversion is the one
+    /// `dovi_tool -m 2` performs: enhancement-layer NALs dropped, each RPU rewritten to 8.1. The
+    /// enhancement layer only ever mattered to a disc player; every panel this app has been
+    /// measured on ignores it and shows the base layer plus the RPU — which is exactly what a
+    /// Profile 8.1 stream is.
+    ///
+    /// Profile 5 is untouched by this (no EL, `bl_compat` 0), and so is a Profile 7 whose base
+    /// layer is not cross-compatible — that one is still refused as `dual-layer`.
+    pub fn converts_to_p81(&self) -> bool {
+        self.present && self.el_present && self.profile == 7 && self.bl_compat != 0
     }
 
     /// PURE: **how this stream will be presented** — the ONE predicate behind both halves of the
@@ -516,8 +537,11 @@ impl Dovi {
     ///
     /// - **not `present`** → [`DvPresentation::NotDv`]. No Dolby Vision, nothing to say, and
     ///   nothing to refuse. This is every ordinary file in the library.
-    /// - **`el_present`** → refuse, always, `signal` or not. Profile 7 splits its picture across a
-    ///   base and an enhancement layer; the pipeline feeds ONE elementary stream and cannot
+    /// - **`el_present`** → refuse, always, `signal` or not — UNLESS it is a Profile 7 with a
+    ///   cross-compatible base layer ([`converts_to_p81`](Self::converts_to_p81)), which the feed
+    ///   path turns into a single-layer Profile 8.1 and which therefore continues to the arms
+    ///   below, declared as profile 8. Any other dual layer splits its picture across a base and
+    ///   an enhancement layer; the pipeline feeds ONE elementary stream and cannot
     ///   interleave the other, so no payload key makes it displayable. (This is also the only
     ///   thing that identifies a dual-layer file: the dev server's P7 reports `bl_compat = 6`.)
     ///   It is deliberately checked BEFORE the declaration arm — which is what keeps the emitted
@@ -547,7 +571,9 @@ impl Dovi {
         if !self.present {
             return DvPresentation::NotDv;
         }
-        if self.el_present {
+        // A convertible Profile 7 falls THROUGH to the arms below, as the 8.1 the feed path really
+        // produces; only a dual layer we cannot convert is still refused here.
+        if self.el_present && !self.converts_to_p81() {
             return DvPresentation::Refuse("dual-layer");
         }
         // Presence of our node enables libpf's DV path even on a television which cannot display
@@ -564,11 +590,21 @@ impl Dovi {
             };
         }
         DvPresentation::Declare(DolbyHdrInfo {
-            profile_id: self.profile,
+            // A converted Profile 7 declares what is actually fed: 8.1, one layer.
+            profile_id: if self.converts_to_p81() {
+                8
+            } else {
+                self.profile
+            },
             // Honest derivation, and unreachable as `"dual"` while the `el_present` arm above
-            // returns first — written this way so that the day an interleaver exists, the payload
-            // follows the refusal being relaxed instead of quietly lying about the track.
-            track_type: if self.el_present { "dual" } else { "single" },
+            // returns first for every dual layer we do not convert — written this way so that the
+            // day an interleaver exists, the payload follows the refusal being relaxed instead of
+            // quietly lying about the track.
+            track_type: if self.el_present && !self.converts_to_p81() {
+                "dual"
+            } else {
+                "single"
+            },
             // Never `"all"`: paired with `trackType: "dual"` that is what sets `dv-dual-svp`, the
             // secure-video-path flag, which this app cannot satisfy.
             encryption_type: "clear",

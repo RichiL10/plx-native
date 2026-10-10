@@ -205,3 +205,55 @@ fn a_runt_packet_is_rejected_before_any_indexing() {
     assert!(!key);
     assert!(out.is_empty(), "size < nls + 1 must bail before the walk");
 }
+
+
+// -- Dolby Vision Profile 7 -> 8.1 on the feed path --------------------------------------
+//
+// HEVC NAL header: F(1) type(6) layer_hi(1) | layer_lo(5) tid(3). A base-layer TRAIL_R slice is
+// `02 01`; the same slice in the enhancement layer (nuh_layer_id 1) is `02 09`; an RPU (UNSPEC62)
+// is `7C 01`.
+
+#[test]
+fn the_layer_id_reads_both_halves_of_the_nal_header() {
+    assert_eq!(hevc_layer_id(&[0x02, 0x01]), 0);
+    assert_eq!(hevc_layer_id(&[0x02, 0x09]), 1);
+    assert_eq!(hevc_layer_id(&[0x03, 0x01]), 32, "bit 0 of byte 0 is the HIGH bit");
+    assert_eq!(hevc_layer_id(&[0x02]), 0, "a runt NAL is never mistaken for an EL");
+}
+
+/// Armed, the enhancement layer never reaches the pipeline: every layer>0 NAL is dropped,
+/// whatever its type, and the base layer is emitted byte for byte.
+#[test]
+fn an_armed_profile_7_feed_drops_the_enhancement_layer() {
+    let bl = [0x02u8, 0x01, 0xAA];
+    let el_slice = [0x02u8, 0x09, 0xBB];
+    let el_sps = [0x42u8, 0x09, 0xCC];
+    let buf = avcc(&[&bl, &el_slice, &el_sps]);
+    let (_, out) = to_annexb_p7(&buf, &[]);
+    assert_eq!(out, vec![0, 0, 0, 1, 0x02, 0x01, 0xAA]);
+}
+
+/// An RPU the converter cannot parse is DROPPED, never forwarded as-is: a Profile 8
+/// declaration followed by a Profile 7 RPU is worse than a frame with no RPU at all.
+#[test]
+fn an_unconvertible_rpu_is_dropped_on_an_armed_feed() {
+    let bl = [0x02u8, 0x01, 0xAA];
+    let bad_rpu = [0x7Cu8, 0x01, 0x00, 0x00, 0x00];
+    let buf = avcc(&[&bl, &bad_rpu]);
+    let (_, out) = to_annexb_p7(&buf, &[]);
+    assert_eq!(out, vec![0, 0, 0, 1, 0x02, 0x01, 0xAA]);
+}
+
+/// Unarmed — every file that is not a convertible Profile 7 — nothing changes: layer>0 NALs
+/// and RPUs pass through exactly as they always did.
+#[test]
+fn an_unarmed_feed_is_untouched_by_the_conversion() {
+    let el_slice = [0x02u8, 0x09, 0xBB];
+    let rpu = [0x7Cu8, 0x01, 0x19, 0x08];
+    let buf = avcc(&[&el_slice, &rpu]);
+    let (_, out) = to_annexb(&buf, true, &[]);
+    assert_eq!(
+        out,
+        vec![0, 0, 0, 1, 0x02, 0x09, 0xBB, 0, 0, 0, 1, 0x7C, 0x01, 0x19, 0x08]
+    );
+}

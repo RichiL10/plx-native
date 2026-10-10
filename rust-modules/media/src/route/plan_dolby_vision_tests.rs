@@ -96,8 +96,16 @@ fn supported_dv_preserves_signal_and_layer_rules() {
                 Some(8),
             );
         }
+        // A convertible Profile 7 is fed as 8.1 (fork: `ff::packet_to_annexb`) and declared as
+        // such; only a dual layer without a cross-compatible base layer is still refused.
         assert_eq!(
-            p7().presentation(signal, Supported, true),
+            p7().presentation(signal, Supported, true)
+                .declared()
+                .map(|n| (n.profile_id, n.track_type)),
+            Some((8, "single")),
+        );
+        assert_eq!(
+            Dovi { bl_compat: 0, ..p7() }.presentation(signal, Supported, true),
             DvPresentation::Refuse("dual-layer"),
         );
     }
@@ -203,11 +211,14 @@ fn declaring_dolby_vision_inverts_the_profile_5_refusal() {
     assert!(!video_direct_plays("hevc", 3840, 1602, dv, &small));
 }
 
-/// Profile 7 is dual-layer: the picture is split across a base and an enhancement layer, and
-/// the pipeline feeds ONE elementary stream. Caught by `el_present` alone — the live P7 item
-/// reports `bl_compat = 6`, so a compatibility-id test would wave it straight through.
+/// **A convertible Profile 7 direct-plays, declared as the 8.1 the feed path makes of it**
+/// (fork). The dual layer used to be refused in both worlds because the pipeline is fed ONE
+/// elementary stream; `ff.rs` now drops the enhancement layer and rewrites the RPUs, so the gate
+/// and the payload both see a single-layer Profile 8.1 — whatever the trigger says, since a
+/// cross-compatible base layer declares unconditionally on a supported set, exactly as P8 does.
 #[test]
-fn a_dual_layer_profile_7_source_does_not_direct_play() {
+fn a_convertible_profile_7_source_direct_plays_as_profile_8() {
+    use plx_platform::devcaps::dv::DvCapability::{Supported, Unknown, Unsupported};
     let caps = plx_platform::devcaps::Caps {
         hevc: true,
         hevc_max: (4096, 2176),
@@ -217,26 +228,51 @@ fn a_dual_layer_profile_7_source_does_not_direct_play() {
         audio: "eac3".into(),
         audio_channels: Default::default(),
     };
-    // and it is refused in BOTH worlds: no payload key can hand the pipeline a layer we do
-    // not feed it, so arming the trigger must not open this gate the way it opens P5's
     for signal in [SILENT, DECLARED] {
-        let dv = p7().presentation(signal, plx_platform::devcaps::dv::DvCapability::Supported, true);
+        let dv = p7().presentation(signal, Supported, true);
         assert!(
-            !video_direct_plays("hevc", 3840, 2160, dv, &caps),
+            video_direct_plays("hevc", 3840, 2160, dv, &caps),
             "signal={signal}"
         );
-        assert_eq!(dv.refusal(), Some("dual-layer"));
-        assert_eq!(
-            dv.declared(),
-            None,
-            "a layer we cannot feed must never be declared"
-        );
+        assert_eq!(dv.refusal(), None);
+        let n = dv.declared().expect("a converted P7 declares");
+        assert_eq!(n.profile_id, 8, "declared as the 8.1 that is actually fed");
+        assert_eq!(n.track_type, "single");
+        assert_eq!(n.encryption_type, "clear");
+        // Without a confirmed Dolby Vision panel nothing is declared, and the HDR10 base layer
+        // the conversion leaves is played as the ordinary HEVC it is.
+        for capability in [Unknown, Unsupported] {
+            let dv = p7().presentation(signal, capability, true);
+            assert_eq!(dv, DvPresentation::NotDv, "{capability:?} signal={signal}");
+            assert!(video_direct_plays("hevc", 3840, 2160, dv, &caps));
+        }
     }
+    assert!(p7().converts_to_p81());
+    assert!(
+        !p7().base_layer_unusable(),
+        "a copy of the converted stream is a displayable stream"
+    );
     assert_ne!(
         p7().bl_compat,
         0,
         "the fixture must keep the trap it was built to hold"
     );
+    // A dual layer WITHOUT a cross-compatible base layer is the one still refused, in both
+    // worlds: there is nothing the conversion could leave on screen.
+    let odd = Dovi {
+        bl_compat: 0,
+        ..p7()
+    };
+    assert!(!odd.converts_to_p81());
+    for signal in [SILENT, DECLARED] {
+        let dv = odd.presentation(signal, Supported, true);
+        assert!(
+            !video_direct_plays("hevc", 3840, 2160, dv, &caps),
+            "signal={signal}"
+        );
+        assert_eq!(dv.refusal(), Some("dual-layer"));
+        assert_eq!(dv.declared(), None, "a layer we cannot feed must never be declared");
+    }
 }
 
 /// On a supported set Profile 8.1 declares in either `nodv` signal state, while every file with no
@@ -440,7 +476,9 @@ fn the_direct_play_gate_and_the_payload_node_can_never_disagree() {
 #[test]
 fn base_layer_usability_by_profile() {
     assert!(p5().base_layer_unusable());
-    assert!(p7().base_layer_unusable());
+    // convertible (fork): the feed path makes an 8.1 of it, whose base layer is the HDR10 it
+    // always was
+    assert!(!p7().base_layer_unusable());
     assert!(!p8().base_layer_unusable());
     assert_eq!(
         p5().presentation(SILENT, plx_platform::devcaps::dv::DvCapability::Supported, true)
