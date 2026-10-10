@@ -656,7 +656,8 @@ fn parse_sinkmax(spec: &str) -> Option<SinkEnvelope> {
 /// getAudioCaps selects audio/x-dts and setAdecSinkInfo_ES configures dts-seamless (issue #221).
 /// Unsupported formats must never be mislabeled as AC3: that can stall the audio master clock.
 fn audio_payload_codec(codec: &str) -> Option<(&'static str, u8)> {
-    match codec {
+    // PMS's `dca` / `dca-ma` is the DTS the gate admitted (`devcaps::dp_audio_key`).
+    match plx_platform::devcaps::dp_audio_key(codec) {
         "ac3" => Some(("AC3", 1)),
         "eac3" => Some(("AC3 PLUS", 2)),
         "aac" => Some(("AAC", 3)),
@@ -4964,6 +4965,10 @@ mod sink_envelope_tests {
     #[test]
     fn audio_payload_names_dts_and_refuses_unsupported_formats() {
         assert_eq!(audio_payload_codec("dts"), Some(("DTS", 4)));
+        // PMS's own spellings of the same track
+        for codec in ["dca", "dca-ma", "dca-hra"] {
+            assert_eq!(audio_payload_codec(codec), Some(("DTS", 4)), "{codec}");
+        }
         assert_eq!(audio_payload_codec("eac3"), Some(("AC3 PLUS", 2)));
         for codec in ["truehd", "flac", "", "unknown"] {
             assert_eq!(audio_payload_codec(codec), None);
