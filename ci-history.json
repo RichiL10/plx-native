@@ -1,5 +1,7 @@
-{"updated":"2026-10-15T19:40:58Z",
-"ci":[],
+{"updated":"2026-10-15T19:41:56Z",
+"ci":[
+{"id":38794974282,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"host harness tests":142,"host lint + type-checks":161,"host unit tests (default features)":406,"host unit tests (hostsim)":446,"host python/shell/C gates":164,"cross-build (armv7) + artifact assertions":396,"host checks (NOT a device gate)":3}}
+],
 "sim":[
 {"id":38794974308,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"macOS simulator build + launch":390,"Linux simulator build + launch":357,"macOS tests against bundled FFmpeg and ASS":388,"Windows launcher syntax":20}}
 ],
