@@ -221,14 +221,27 @@ fn the_layer_id_reads_both_halves_of_the_nal_header() {
     assert_eq!(hevc_layer_id(&[0x02]), 0, "a runt NAL is never mistaken for an EL");
 }
 
-/// Armed, the enhancement layer never reaches the pipeline: every layer>0 NAL is dropped,
-/// whatever its type, and the base layer is emitted byte for byte.
+// FORK (RichiL10): ported from upstream-proposal b228a516 — a single-track dual layer (every UHD
+// Blu-ray remux) wraps each enhancement-layer NAL in UNSPEC63 on layer 0, `7E 01`.
+#[test]
+fn an_enhancement_layer_nal_is_recognised_by_either_spelling() {
+    assert!(is_dv_enhancement_layer(&[0x7E, 0x01, 0x40, 0x01]), "UNSPEC63 wrapper");
+    assert!(is_dv_enhancement_layer(&[0x02, 0x09]), "a layer-1 slice");
+    assert!(!is_dv_enhancement_layer(&[0x02, 0x01]), "a base-layer slice");
+    assert!(!is_dv_enhancement_layer(&[0x7C, 0x01]), "the RPU is not the enhancement layer");
+    assert!(!is_dv_enhancement_layer(&[0x7E]), "a runt NAL");
+}
+
+/// Armed, the enhancement layer never reaches the pipeline, whichever way it is carried (the
+/// UNSPEC63 wrapper, or any layer>0 NAL whatever its type), and the base layer is emitted byte
+/// for byte.
 #[test]
 fn an_armed_profile_7_feed_drops_the_enhancement_layer() {
     let bl = [0x02u8, 0x01, 0xAA];
+    let el_wrapped = [0x7Eu8, 0x01, 0x02, 0x01, 0xBB];
     let el_slice = [0x02u8, 0x09, 0xBB];
     let el_sps = [0x42u8, 0x09, 0xCC];
-    let buf = avcc(&[&bl, &el_slice, &el_sps]);
+    let buf = avcc(&[&bl, &el_wrapped, &el_slice, &el_sps]);
     let (_, out) = to_annexb_p7(&buf, &[]);
     assert_eq!(out, vec![0, 0, 0, 1, 0x02, 0x01, 0xAA]);
 }
@@ -248,12 +261,16 @@ fn an_unconvertible_rpu_is_dropped_on_an_armed_feed() {
 /// and RPUs pass through exactly as they always did.
 #[test]
 fn an_unarmed_feed_is_untouched_by_the_conversion() {
+    let el_wrapped = [0x7Eu8, 0x01, 0xBB];
     let el_slice = [0x02u8, 0x09, 0xBB];
     let rpu = [0x7Cu8, 0x01, 0x19, 0x08];
-    let buf = avcc(&[&el_slice, &rpu]);
+    let buf = avcc(&[&el_wrapped, &el_slice, &rpu]);
     let (_, out) = to_annexb(&buf, true, &[]);
     assert_eq!(
         out,
-        vec![0, 0, 0, 1, 0x02, 0x09, 0xBB, 0, 0, 0, 1, 0x7C, 0x01, 0x19, 0x08]
+        vec![
+            0, 0, 0, 1, 0x7E, 0x01, 0xBB, 0, 0, 0, 1, 0x02, 0x09, 0xBB, 0, 0, 0, 1, 0x7C, 0x01,
+            0x19, 0x08
+        ]
     );
 }

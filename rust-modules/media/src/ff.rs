@@ -2793,6 +2793,15 @@ static SEI_STRIPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64
 static EL_DROPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static RPU_REWRITTEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static RPU_FAILED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+// FORK (RichiL10): one-time evidence per demux run (re-armed where the conversion is armed) that
+// the enhancement layer is really being dropped, one flag per spelling it can arrive in.
+static EL_UNSPEC63_LOGGED: AtomicBool = AtomicBool::new(false);
+static EL_LAYER_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// HEVC `UNSPEC63`: the NAL type a single-track Dolby Vision dual layer (a UHD Blu-ray remux)
+/// wraps each enhancement-layer NAL in. It is what `dovi_tool demux` splits the enhancement layer
+/// out by, and what `dovi_tool convert --discard` drops.
+const HEVC_NAL_DV_EL: u8 = 63;
 
 /// `nuh_layer_id` of an HEVC NAL (`nal` starts at the 2-byte NAL header): bit 0 of byte 0 is the
 /// high bit, the top five bits of byte 1 the rest. A single-layer stream is layer 0 throughout; a
@@ -2804,6 +2813,21 @@ fn hevc_layer_id(nal: &[u8]) -> u8 {
         return 0;
     }
     ((nal[0] & 1) << 5) | (nal[1] >> 3)
+}
+
+/// True if this HEVC NAL is wrapped in `UNSPEC63`, the single-track dual-layer spelling of a
+/// Dolby Vision enhancement-layer NAL. `nal` starts at the 2-byte NAL header.
+fn is_dv_el_unspec63(nal: &[u8]) -> bool {
+    nal.len() >= 2 && ((nal[0] >> 1) & 0x3f) == HEVC_NAL_DV_EL
+}
+
+/// True if this HEVC NAL belongs to a Dolby Vision enhancement layer: wrapped in `UNSPEC63`, as a
+/// single-track dual layer stores it, or carried in a layer above the base (`nuh_layer_id > 0`),
+/// which a single-layer decoder never decodes either. `nal` starts at the 2-byte NAL header.
+// FORK (RichiL10): ported from upstream-proposal b228a516; the fork used to test only the layer id,
+// so every UHD Blu-ray remux (EL in UNSPEC63 on layer 0) still fed its EL to the decoder.
+fn is_dv_enhancement_layer(nal: &[u8]) -> bool {
+    nal.len() >= 2 && (is_dv_el_unspec63(nal) || hevc_layer_id(nal) > 0)
 }
 
 /// Rewrite a Dolby Vision RPU NAL (HEVC UNSPEC62; `nal` = 2-byte header + payload, emulation-
@@ -2876,7 +2900,8 @@ fn nal_end(i: usize, nl: usize, size: usize) -> Option<usize> {
 /// types 16-23). Returns true if it is a keyframe. Mirrors mkv_handle_block.
 ///
 /// `dv_p7` — the stream is a dual-layer Dolby Vision **Profile 7** being converted to 8.1 on the
-/// way to the pipeline: every enhancement-layer NAL (`nuh_layer_id` > 0) is dropped and every
+/// way to the pipeline: every enhancement-layer NAL ([`is_dv_enhancement_layer`]: the `UNSPEC63`
+/// wrapper or `nuh_layer_id` > 0) is dropped and every
 /// RPU NAL (type 62) is rewritten by [`rewrite_rpu_p7_to_p81`], so what leaves here is the
 /// single-layer stream the Load payload declares (`DolbyHdrInfo profileId 8`).
 unsafe fn packet_to_annexb(
@@ -2934,9 +2959,22 @@ unsafe fn packet_to_annexb(
         };
         let nal = &d[i..end];
         if is_hevc && dv_p7 {
-            // Profile 7 -> 8.1, in-app: the enhancement layer never reaches the pipeline, and each
+            // Profile 7 -> 8.1, in-app: the enhancement layer (UNSPEC63-wrapped or layer > 0) never
+            // reaches the pipeline, and each
             // RPU is rewritten so the dynamic metadata describes the single layer that does.
-            if hevc_layer_id(nal) > 0 {
+            if is_dv_enhancement_layer(nal) {
+                // FORK (RichiL10): the package / on-TV evidence, once per demux run and spelling.
+                if is_dv_el_unspec63(nal) {
+                    if !EL_UNSPEC63_LOGGED.swap(true, Ordering::Relaxed) {
+                        crate::player::log(
+                            "ff: Dolby Vision P7 enhancement layer dropped (UNSPEC63)",
+                        );
+                    }
+                } else if !EL_LAYER_LOGGED.swap(true, Ordering::Relaxed) {
+                    crate::player::log(
+                        "ff: Dolby Vision P7 enhancement layer dropped (nuh_layer_id > 0)",
+                    );
+                }
                 let n = EL_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n <= 3 || n % 5000 == 0 {
                     crate::player::log(&format!(
@@ -8101,6 +8139,9 @@ pub fn demux(
                     crate::player::log(
                         "ff: Dolby Vision P7 -> P8.1 conversion armed (EL dropped, RPUs rewritten)",
                     );
+                    // FORK (RichiL10): re-arm the one-time EL-drop evidence for this run.
+                    EL_UNSPEC63_LOGGED.store(false, Ordering::Relaxed);
+                    EL_LAYER_LOGGED.store(false, Ordering::Relaxed);
                 }
                 let (param_blob, nal_len_size) = parse_extradata(
                     (*vcp).extradata,
