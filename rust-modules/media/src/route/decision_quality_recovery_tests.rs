@@ -2735,3 +2735,29 @@ fn manual_original_after_a_fixed_rung_with_a_subtitle_returns_to_direct_play() {
     crate::player::reset_audio_track();
     crate::player::reset_subtitle();
 }
+
+/// A video-copy progressive remux is still the source HEVC stream; its frozen declaration must
+/// survive the server-output reset used by real video encodes.
+#[test]
+fn a_video_copy_remux_keeps_its_frozen_dolby_vision_declaration() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    assert!(set_stream_declaration_for_test(
+        &mut ps,
+        "hevc",
+        "ac3",
+        23.976,
+        p8(),
+        false,
+        plx_platform::devcaps::dv::DvCapability::Supported,
+    ));
+    let frozen = stream_dv_decision(&ps);
+    ps.cur_contract = plx_plex::plex::EncodeContract::original(
+        true,
+        plx_plex::plex::AudioEnhancements::NONE,
+    );
+    clear_output_dv(&mut ps);
+    assert_eq!(stream_dv_decision(&ps), frozen);
+    assert_eq!(stream_dovi(&ps).profile, 8);
+    reset_session(&mut ps);
+}

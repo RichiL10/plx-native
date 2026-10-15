@@ -241,9 +241,65 @@ fn profile_for(caps: &plx_platform::devcaps::Caps) -> String {
     profile_for_delivery(caps, TranscodeDelivery::ProgressiveMkv)
 }
 
-/// The profile for THIS device — [`profile_for`] over the boot-probed caps snapshot.
+// FORK (RichiL10): audio encodes must follow the physical output, not merely the panel's decoder.
+// The complete direct-play list remains in the profile; only the target order changes.
+fn sound_output_value() -> String {
+    match plx_platform::tv::sound_output() {
+        plx_platform::tv::SoundOutputReply::Reply(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.pointer("/settings/soundOutput").and_then(serde_json::Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned()),
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn audio_encode_targets(caps: &plx_platform::devcaps::Caps) -> (String, String) {
+    let output = sound_output_value();
+    let requested = plx_base::forkknobs::get("encode_audio");
+    let optical = output.to_ascii_lowercase().contains("optical");
+    let preferred = match requested.as_deref() {
+        Some("ac3") => ["ac3", "eac3"],
+        Some("eac3") => ["eac3", "ac3"],
+        _ if optical => ["ac3", "eac3"],
+        _ => ["eac3", "ac3"],
+    };
+    let mut codecs = preferred
+        .into_iter()
+        .filter(|codec| caps.audio_has(codec))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for codec in ["aac", "dts"] {
+        if caps.audio_has(codec) && !codecs.iter().any(|current| current == codec) {
+            codecs.push(codec.to_owned());
+        }
+    }
+    if codecs.is_empty() {
+        codecs.push("aac".to_owned());
+    }
+    let list = codecs.join(",");
+    plx_base::eventlog::log(&format!("audio: encode target={list} (sound output={output})"));
+    (list, output)
+}
+
 fn profile_extra(delivery: TranscodeDelivery) -> String {
-    profile_for_delivery(plx_platform::devcaps::caps(), delivery)
+    let caps = plx_platform::devcaps::caps();
+    let baseline = profile_for_delivery(caps, delivery);
+    if matches!(delivery, TranscodeDelivery::FixedHls { .. }) {
+        return baseline;
+    }
+    let (target_audio, _) = audio_encode_targets(caps);
+    let current = ["ac3", "eac3", "aac", "dts"]
+        .into_iter()
+        .filter(|codec| caps.audio_has(codec))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (before, target) = baseline
+        .split_once("add-transcode-target")
+        .expect("profile contains its progressive transcode target");
+    format!(
+        "{before}add-transcode-target{}",
+        target.replacen(&format!("audioCodec={current}"), &format!("audioCodec={target_audio}"), 1),
+    )
 }
 
 fn forced_direct_profile() -> String {

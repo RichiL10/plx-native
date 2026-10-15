@@ -5213,12 +5213,46 @@ pub fn stream_dv_decision(ps: &PlaybackSession) -> plx_data::metadata::DvDecisio
     ps.stream_dv_decision
 }
 
-/// Server output (HLS encode, progressive encode or container remux) carries no client-frozen
-/// source declaration. Centralizing the paired reset prevents a future route mutation from
-/// clearing the raw metadata while leaving a stale `Declare` behind for Load.
+/// Clear source Dolby Vision only when the server changed the video elementary stream.  A
+/// progressive remux whose video decision is `copy` carries the source HEVC bitstream unchanged,
+/// so it must retain the frozen declaration that direct play would have used.
 fn clear_output_dv(session: &mut PlaybackSession) {
+    // FORK (RichiL10): PMS may omit the Matroska DOVI configuration record while retaining the
+    // HEVC RPU NALs.  The frozen source decision is therefore the only truthful Load declaration.
+    if plx_base::forkknobs::is("remux_dv", "on", "on")
+        && session.cur_contract.remux
+        && session.stream_vcodec.eq_ignore_ascii_case("hevc")
+        && session.stream_dv_decision.presentation.declared().is_some()
+    {
+        crate::player::log(&format!(
+            "route: remux keeps Dolby Vision (P{}{}, video copy)",
+            session.stream_dovi.profile,
+            if session.stream_dovi.converts_to_p81() { "->8.1" } else { "" },
+        ));
+        return;
+    }
     session.stream_dovi = plx_data::metadata::Dovi::NONE;
     session.stream_dv_decision = plx_data::metadata::DvDecision::NONE;
+}
+
+/// Thread-safe frozen Dolby Vision source metadata for the current physical route.  The demuxer
+/// uses this only when a PMS remux lost its container DOVI record.
+pub fn frozen_route_dovi() -> plx_data::metadata::Dovi {
+    PLAYER_CONTROL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied_projection
+        .as_ref()
+        .map_or(plx_data::metadata::Dovi::NONE, |p| p.stream_dovi)
+}
+
+pub fn frozen_route_declares_dv() -> bool {
+    PLAYER_CONTROL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied_projection
+        .as_ref()
+        .is_some_and(|p| p.stream_dv_decision.presentation.declared().is_some())
 }
 /// Is the audio being fed a Dolby Atmos stream? — the Load payload's `contents.immersive` node.
 /// See [`PlaybackSession::stream_immersive`].

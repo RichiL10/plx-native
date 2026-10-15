@@ -14,6 +14,10 @@ use std::sync::OnceLock;
 #[cfg_attr(any(feature = "hostsim", test, feature = "test-support"), allow(dead_code))] // Reply/Unavailable: TV arm only
 pub enum LocaleReply { NoPlatform, Unavailable, Reply(String) }
 
+/// The current output route reported by settingsservice.  The Plex profile only needs the raw
+/// value so unknown future outputs remain safely non-optical.
+pub enum SoundOutputReply { NoPlatform, Unavailable, Reply(String) }
+
 pub struct Port {
     pub probe_device: fn(),
     pub start_capability_probe: fn(),
@@ -22,6 +26,7 @@ pub struct Port {
     pub open: fn(&secure::Sealed) -> Option<Vec<u8>>,
     pub remove: fn(&secure::Backend, &str),
     pub system_locale: fn() -> LocaleReply,
+    pub sound_output: fn() -> SoundOutputReply,
     pub go_home: fn(),
     pub poll_home: fn(),
     pub deliver_toast: fn(&str, toast::Identity) -> toast::Sent,
@@ -54,6 +59,7 @@ static ABSENT: Port = Port {
     open: |_| None,
     remove: |_, _| {},
     system_locale: || LocaleReply::NoPlatform,
+    sound_output: || SoundOutputReply::NoPlatform,
     go_home: nothing,
     poll_home: nothing,
     deliver_toast: toast::deliver_without_port,
@@ -94,3 +100,4 @@ fn absent() -> &'static Port {
 pub fn probe_device() { (port().probe_device)() }
 pub fn start_capability_probe() { (port().start_capability_probe)() }
 pub fn system_locale() -> LocaleReply { (port().system_locale)() }
+pub fn sound_output() -> SoundOutputReply { (port().sound_output)() }
