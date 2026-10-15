@@ -10027,6 +10027,14 @@ pub fn enhancement_test_session(route: EnhTestFixture) -> (PlaybackSession, Serv
 /// CONTAINER audio ordinal (the menu converts its row via metadata::audio_ordinal); `audio` itself
 /// is the frozen `CarriedAudio` snapshot (issue #266) the menu built via `CarriedAudio::from_stream`.
 pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
+    commit_audio_pick(ps, audio, true);
+}
+
+/// FORK (RichiL10): [`commit_audio_selection`]'s body. `may_release` is `false` only for the
+/// replay of a pick deferred behind an Original trial (`apply_deferred_original_effects`): a
+/// replay onto a remux the trial just rolled back to must not retry the Original that failed, so
+/// only a live pick may release the fork's plain remux ([`fork_pick_releases_remux`]).
+fn commit_audio_pick(ps: &mut PlaybackSession, audio: CarriedAudio, may_release: bool) {
     if forced_direct_play(ps) && !audio_track_direct_plays(ps, &audio.codec, audio.channels) {
         ps.play_verdict = Some(PlayVerdict::Forced(ForcedFailure::AudioNeedsConversion));
         return;
@@ -10095,6 +10103,24 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
         crate::player::note_audio_pick();
         return;
     }
+    // FORK (RichiL10): the fork's plain remux exists only because an earlier pick could not
+    // direct-play. A pick the TV decodes goes back to the file, carrying that track, instead of
+    // asking PMS for a new remux that would re-encode it. Upstream's enhancement release does the
+    // same: a `RecoverOriginal(EnhancementReleased)` claim (primary `ReleaseToDirect`) marked as
+    // owing this pick its reload, so a refused release still runs the server retranscode with the
+    // new track (`ClaimFallback::Legacy`). Queued only from here, so no other path can trigger it.
+    if may_release && fork_pick_releases_remux(ps, direct_plays) {
+        crate::player::log("route: audio pick direct-plays - releasing the remux back to the original file");
+        queue_user_route_intent(
+            ps,
+            UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased),
+            true,
+        );
+        // the same cue reset the pick's own reload does (`request_audio_switch`)
+        crate::player::SHARED.sub_cues.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::player::note_audio_pick();
+        return;
+    }
     if native {
         crate::player::request_audio_track(ps, ordinal, &codec);
     } else {
@@ -10102,6 +10128,25 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
     }
     // the rebuild now loading is this pick's: the read-out says "Switching audio…"
     crate::player::note_audio_pick();
+}
+
+/// FORK (RichiL10): **does this audio pick release the fork's plain remux back to the file?** Only
+/// for a pick the TV decodes (`direct_plays`), on Auto/Original quality (desired and applied: a
+/// fixed rung keeps its cap), while the live route is a plain progressive-MKV remux (video copied,
+/// no burn, no enhancement applied or wanted) whose Original candidate, already retargeted to the
+/// pick, feeds the Part. Nothing else may be queued: a pending quality or subtitle action keeps
+/// the pick's ordinary reload rather than being overtaken by the recovery (the merge lets a
+/// `RecoverOriginal` replace whatever is pending).
+fn fork_pick_releases_remux(ps: &PlaybackSession, direct_plays: bool) -> bool {
+    direct_plays
+        && enhancement_quality()
+        && matches!(applied_quality(), Quality::Auto | Quality::Original)
+        && is_transcoding(ps)
+        && live_family(ps) == RouteFamily::Remux
+        && !ps.cur_contract.audio.any()
+        && !want_live(ps).any()
+        && ps.auto_original.as_ref().is_some_and(|c| c.feeds_part())
+        && PLAYER_CONTROL.lock().unwrap_or_else(|e| e.into_inner()).pending_user.is_none()
 }
 
 /// Apply commands which were attached to one exact Original trial, after either the candidate or
@@ -10112,7 +10157,8 @@ pub fn apply_deferred_original_effects(ps: &mut PlaybackSession, mut effects: De
         apply_quality_choice(ps, q);
     }
     if let Some(audio) = effects.audio.take() {
-        commit_audio_selection(ps, audio);
+        // FORK (RichiL10): a replay never releases the fork remux (see `commit_audio_pick`).
+        commit_audio_pick(ps, audio, false);
     }
     if effects.reconcile {
         reconcile_enhancement(ps, false);
