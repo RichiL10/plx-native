@@ -2663,11 +2663,17 @@ fn pick_dp_audio_mode(
 /// PMS facts (`metadata::audio_facts`). A rate PMS never stated is admitted; the Load, which
 /// declares from the same facts, refuses a wrong one.
 fn enc_lane_rate_ok(s: &plx_data::metadata::Stream) -> bool {
+    enc_lane_rate_ok_for(s.id, &s.codec, s.channels)
+}
+
+/// FORK (RichiL10): [`enc_lane_rate_ok`] for a track known by its PMS id, codec and channels (a
+/// carried pick mid-playback, `route::decision::carried_audio_direct_plays`).
+pub(super) fn enc_lane_rate_ok_for(sid: i64, codec: &str, channels: i64) -> bool {
     let caps = plx_platform::devcaps::caps();
-    if !caps.enc_lane_candidate(&s.codec, s.channels, plx_platform::devcaps::encode_lane_on()) {
+    if !caps.enc_lane_candidate(codec, channels, plx_platform::devcaps::encode_lane_on()) {
         return true;
     }
-    let rate = plx_data::metadata::audio_facts(s.id).map_or(0, |f| f.rate);
+    let rate = plx_data::metadata::audio_facts(sid).map_or(0, |f| f.rate);
     rate == 0 || rate == plx_platform::devcaps::ENC_LANE_RATE
 }
 

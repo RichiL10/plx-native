@@ -899,4 +899,75 @@ mod tests {
             assert_eq!(*pts, packet_pts(t0 + 32_000_000 * k as i64), "packet {k}: 32 ms step");
         }
     }
+
+    /// FORK (RichiL10): **real FLAC and TrueHD streams through the whole lane**: decoder (and
+    /// TrueHD's `downmix` option), the layout read back off the decoded frame, fold, FIFO and
+    /// encoder. The bundled FFmpeg has no FLAC/TrueHD encoder, so a full FFmpeg makes the fixtures
+    /// into `PLX_ENC_FIXTURES`: 3 s of 48 kHz tones, one per channel, in Matroska - `flac71.mkv`
+    /// (24-bit 7.1), `flac51.mkv` (24-bit 5.1(side)) and `truehd.mkv` (the widest layout the
+    /// experimental TrueHD encoder accepts). A fixture that was not generated is skipped by name.
+    #[test]
+    #[ignore = "needs the host build of the bundled FFmpeg and PLX_ENC_FIXTURES"]
+    fn real_flac_and_truehd_streams_encode_to_ac3() {
+        let _g = plx_base::testlock::serial();
+        super::super::image_subtitle_tests::bind_host_ffmpeg();
+        let dir = std::path::PathBuf::from(std::env::var_os("PLX_ENC_FIXTURES").expect("PLX_ENC_FIXTURES"));
+        let mut ran = 0;
+        for name in ["flac71.mkv", "flac51.mkv", "truehd.mkv"] {
+            let path = dir.join(name);
+            if !path.exists() {
+                eprintln!("skip {name}: not generated");
+                continue;
+            }
+            ran += 1;
+            let url = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            unsafe {
+                let mut fmt: *mut AVFormatContext = std::ptr::null_mut();
+                assert!(
+                    avformat_open_input(&mut fmt, url.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut()) >= 0,
+                    "{name}: open"
+                );
+                assert!(avformat_find_stream_info(fmt, std::ptr::null_mut()) >= 0, "{name}: stream info");
+                let streams = (*fmt).streams;
+                let ai = (0..(*fmt).nb_streams as usize)
+                    .find(|&i| (*stream_codecpar(*streams.add(i))).codec_type == AVMEDIA_TYPE_AUDIO)
+                    .expect("an audio stream");
+                let st = *streams.add(ai);
+                let acp = stream_codecpar(st);
+                let channels = (*acp).ch_layout.nb_channels as u32;
+                let mut lane = EncLane::open(acp, EncSpec { channels }).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let mut pkt = av_packet_alloc();
+                let mut got: Vec<(i64, Vec<u8>)> = Vec::new();
+                while av_read_frame(fmt, pkt) >= 0 {
+                    if (*pkt).stream_index as usize == ai {
+                        let pts = pts_ns_opt(pkt, st);
+                        got.extend(lane.convert(pkt, pts).iter().cloned());
+                    }
+                    av_packet_unref(pkt);
+                }
+                av_packet_free(&mut pkt);
+                avformat_close_input(&mut fmt);
+                assert_eq!(lane.errors, 0, "{name}: lane errors");
+                // 3 s at 48 kHz = 93.75 frames of 1536 samples; the partial last one stays queued.
+                assert!((90..=94).contains(&got.len()), "{name}: {} AC3 frames", got.len());
+                for (k, (_, bytes)) in got.iter().enumerate() {
+                    assert_eq!(&bytes[..2], &[0x0b, 0x77], "{name} packet {k}: AC3 sync word");
+                    assert_eq!(bytes.len(), 2560, "{name} packet {k}: 640 kbps frame size");
+                }
+                for w in got.windows(2) {
+                    assert_eq!(w[1].0 - w[0].0, 32_000_000, "{name}: 32 ms pts step");
+                }
+                // tones went in, so the frames cannot all be the same bytes
+                assert!(got.windows(2).any(|w| w[0].1 != w[1].1), "{name}: every AC3 frame identical");
+                // PLX_ENC_DUMP=1: keep the elementary AC3 stream beside the fixture, so a full
+                // FFmpeg can decode it and check each output channel's tones (the channel mapping).
+                if std::env::var_os("PLX_ENC_DUMP").is_some() {
+                    let es: Vec<u8> = got.iter().flat_map(|(_, b)| b.iter().copied()).collect();
+                    std::fs::write(dir.join(format!("out-{name}.ac3")), es).expect("dump the AC3 stream");
+                }
+                eprintln!("{name}: {channels}ch -> {} AC3 frames", got.len());
+            }
+        }
+        assert!(ran > 0, "no fixture in PLX_ENC_FIXTURES");
+    }
 }

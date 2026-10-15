@@ -6597,6 +6597,15 @@ pub fn audio_track_direct_plays(ps: &PlaybackSession, codec: &str, channels: i64
     audio_direct_plays(ps.direct_play_mode, codec, channels)
 }
 
+/// FORK (RichiL10): [`audio_track_direct_plays`] for a carried track, plus the in-app AC3 encode
+/// lane's 48 kHz rule (`plan::enc_lane_rate_ok_for`, read from the track's PMS facts). Without it a
+/// mid-playback pick of a 96 kHz TrueHD or multichannel FLAC track would switch in place to a Load
+/// the encode lane then refuses, instead of letting the server convert it.
+fn carried_audio_direct_plays(ps: &PlaybackSession, a: &CarriedAudio) -> bool {
+    audio_track_direct_plays(ps, &a.codec, a.channels)
+        && super::plan::enc_lane_rate_ok_for(a.sid, &a.codec, a.channels)
+}
+
 /// **Would the server convert this track's audio if it played?** The track menu's "converted by
 /// your server" mark: a track the TV cannot decode (`audio_direct_plays`, the same capability
 /// answer the planner and the profile use) plays through the server's remux or re-encode with its
@@ -9501,7 +9510,7 @@ pub enum LegacyAction {
 
 pub fn legacy_action(ps: &PlaybackSession) -> LegacyAction {
     match (live_family(ps), ps.cur_audio.as_ref()) {
-        (RouteFamily::Direct, Some(a)) if audio_track_direct_plays(ps, &a.codec, a.channels) => {
+        (RouteFamily::Direct, Some(a)) if carried_audio_direct_plays(ps, a) => {
             LegacyAction::Native {
                 ordinal: a.ordinal,
                 codec: a.codec.clone(),
@@ -10182,7 +10191,7 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) {
 /// replay onto a remux the trial just rolled back to must not retry the Original that failed, so
 /// only a live pick may release the fork's plain remux ([`fork_pick_releases_remux`]).
 fn commit_audio_pick(ps: &mut PlaybackSession, audio: CarriedAudio, may_release: bool) {
-    if forced_direct_play(ps) && !audio_track_direct_plays(ps, &audio.codec, audio.channels) {
+    if forced_direct_play(ps) && !carried_audio_direct_plays(ps, &audio) {
         ps.play_verdict = Some(PlayVerdict::Forced(ForcedFailure::AudioNeedsConversion));
         return;
     }
@@ -10205,7 +10214,7 @@ fn commit_audio_pick(ps: &mut PlaybackSession, audio: CarriedAudio, may_release:
     // A standing Burn is wire-shaped `Other`, but it is an Original-family route: the pick must
     // retarget the candidate the release returns to, exactly as on a remux.
     let family = enhancement_family(ps);
-    let direct_plays = audio_track_direct_plays(ps, &audio.codec, audio.channels);
+    let direct_plays = carried_audio_direct_plays(ps, &audio);
     match family {
         // The recovery declaration captures one exact source/audio pairing. Once the user changes
         // that pairing while HLS is live, do not later resurrect the old track behind their back.
@@ -10470,7 +10479,7 @@ fn fork_subtitle_pick_releases(ps: &PlaybackSession) -> bool {
     let direct_plays = ps
         .cur_audio
         .as_ref()
-        .is_some_and(|a| audio_track_direct_plays(ps, &a.codec, a.channels));
+        .is_some_and(|a| carried_audio_direct_plays(ps, a));
     fork_release_open(ps, direct_plays)
 }
 
