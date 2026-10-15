@@ -2966,6 +2966,20 @@ unsafe fn packet_to_annexb(
 
 static DIAG_FIRST: AtomicBool = AtomicBool::new(true);
 
+/// Does one Annex-B HEVC access unit carry a Dolby Vision RPU (unspecified NAL type 62)?
+fn annexb_has_hevc_rpu(data: &[u8]) -> bool {
+    let mut cursor = 0;
+    while let Some((start, prefix)) = annexb_start(data, cursor) {
+        let payload = start + prefix;
+        let end = annexb_start(data, payload).map_or(data.len(), |(next, _)| next);
+        if data.get(payload..end).is_some_and(|nal| nal.len() >= 2 && ((nal[0] >> 1) & 0x3f) == 62) {
+            return true;
+        }
+        cursor = payload;
+    }
+    false
+}
+
 /// Extract one DTS core access unit, dropping the DTS-HD extension substream. Matroska and
 /// MOV demux return the complete packet; our bundled FFmpeg 9.0 has neither the dca parser nor
 /// dca_core BSF enabled. The core size is the 14-bit FSIZE + 1 from its normalized header
@@ -8018,16 +8032,20 @@ pub fn demux(
                 // build the AU from the codecpar extradata; libavformat still owns demux + seeking.
                 let is_hevc = (*vcp).codec_id == AV_CODEC_ID_HEVC;
                 // Dolby Vision Profile 7 (dual-layer, cross-compatible base layer) is converted to
-                // Profile 8.1 while feeding — `packet_to_annexb` drops the enhancement layer and
-                // rewrites the RPUs — so the pipeline is handed the single-layer shape the Load
-                // payload declares (`DolbyHdrInfo profileId 8`, see
-                // `plx_data::metadata::Dovi::converts_to_p81`).
-                let dv_p7 = is_hevc
-                    && dovi_conf(vcp).is_some_and(|d| {
-                        d.dv_profile == 7
-                            && d.el_present_flag != 0
-                            && d.dv_bl_signal_compatibility_id != 0
-                    });
+                // Profile 8.1 while feeding.  PMS's Matroska remux can preserve the HEVC RPU NALs
+                // yet omit the DOVI configuration record, so retain the route's frozen source
+                // decision as a narrow fallback for that observed server shape.
+                let container_p7 = dovi_conf(vcp).is_some_and(|d| {
+                    d.dv_profile == 7
+                        && d.el_present_flag != 0
+                        && d.dv_bl_signal_compatibility_id != 0
+                });
+                // FORK (RichiL10): a video-copy remux has the source bitstream even when its
+                // Matroska codec parameters lost the DOVI record.
+                let route_p7 = dovi_conf(vcp).is_none()
+                    && plx_base::forkknobs::is("remux_dv", "on", "on")
+                    && crate::route::frozen_route_dovi().converts_to_p81();
+                let dv_p7 = is_hevc && (container_p7 || route_p7);
                 if dv_p7 {
                     crate::player::log(
                         "ff: Dolby Vision P7 -> P8.1 conversion armed (EL dropped, RPUs rewritten)",
@@ -8055,6 +8073,10 @@ pub fn demux(
                 }
 
                 let mut anchor_taken = false;
+                // FORK (RichiL10): a declared DV route without RPU NALs is almost always a PMS
+                // remux metadata loss worth diagnosing on-device.
+                let mut dv_aus_checked = 0u8;
+                let mut dv_rpu_seen = false;
                 // INNER read loop
                 loop {
                     // Direct-play seek (and the armed resume, which is just a seek published before
@@ -8137,6 +8159,13 @@ pub fn demux(
                             &mut aubuf,
                         );
                         let pts = pts_ns(pkt, vst);
+                        if is_hevc && crate::route::frozen_route_declares_dv() && dv_aus_checked < 48 {
+                            dv_aus_checked += 1;
+                            dv_rpu_seen |= annexb_has_hevc_rpu(&aubuf);
+                            if dv_aus_checked == 48 && !dv_rpu_seen {
+                                crate::player::log("ff: Dolby Vision declared but no RPU NALs seen in first 48 video AUs");
+                            }
+                        }
                         if DIAG_FIRST.swap(false, Ordering::Relaxed) {
                             let n = aubuf.len().min(40);
                             let head: String = aubuf[..n]
