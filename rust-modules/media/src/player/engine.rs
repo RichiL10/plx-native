@@ -669,6 +669,10 @@ fn audio_payload_codec(codec: &str) -> Option<(&'static str, u8)> {
         "eac3" => Some(("AC3 PLUS", 2)),
         "aac" => Some(("AAC", 3)),
         "dts" => Some(("DTS", 4)),
+        // FORK (RichiL10): FLAC leaves the app decoded, so it is declared as the PCM it becomes;
+        // both need the pcmInfo the Load builder splices (`with_audio_info`).
+        "flac" | "pcm" => Some(("PCM", 5)),
+        "opus" => Some(("OPUS", 6)),
         _ => None,
     }
 }
@@ -715,7 +719,9 @@ fn build_av_payload(ps: &crate::route::PlaybackSession, video: &str, audio: &str
         ));
     }
     let p = with_dolby_hdr_info(&p, video, crate::route::stream_dv_presentation(ps));
-    with_immersive(&p, audio, crate::route::stream_immersive(ps))
+    let p = with_immersive(&p, audio, crate::route::stream_immersive(ps));
+    // FORK (RichiL10): pcmInfo / opusInfo for the fork's audio lanes.
+    with_audio_info(&p, audio, crate::route::stream_audio_lane(ps))
 }
 
 /// The `contents.immersive` node — **the Dolby Atmos half of the same envelope**, and the reason
@@ -837,7 +843,114 @@ fn with_dolby_hdr_info(p: &str, video: &str, dv: plx_data::metadata::DvPresentat
     p.replace(anchor, &format!("{anchor}{node}"))
 }
 
-/// `"appId":"<this install's id>"` — the payload key, and the anchor `with_window_id` splices onto.
+/// FORK (RichiL10): what the Load declares beside `codec.audio` for the fork's own audio lanes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioLaneInfo {
+    /// FLAC decoded in-app, or a native PCM track: `codec.audio = "PCM"` + `contents.pcmInfo`.
+    Pcm(crate::ff::PcmSpec),
+    /// Opus fed as-is: `codec.audio = "OPUS"` + `contents.opusInfo`.
+    Opus { channels: u32 },
+}
+
+impl AudioLaneInfo {
+    /// The lane for the route's OUTPUT audio codec, from the carried track's metadata (PMS
+    /// `samplingRate`, `channels`, `bitDepth`). `None` for every codec the pipeline decodes
+    /// itself, and for a lane codec whose facts are missing (the caller refuses that Load).
+    pub fn for_track(acodec: &str, rate: i64, channels: i64, bit_depth: i64, pcm_hi: Option<&str>) -> Option<AudioLaneInfo> {
+        match plx_platform::devcaps::dp_audio_key(acodec) {
+            "flac" | "pcm" => crate::ff::PcmSpec::for_track(rate, channels, bit_depth, pcm_hi).map(AudioLaneInfo::Pcm),
+            "opus" if (1..=8).contains(&channels) => Some(AudioLaneInfo::Opus { channels: channels as u32 }),
+            _ => None,
+        }
+    }
+
+    /// The `codec.audio` this lane must be declared under.
+    pub fn payload_codec(self) -> &'static str {
+        match self {
+            AudioLaneInfo::Pcm(_) => "PCM",
+            AudioLaneInfo::Opus { .. } => "OPUS",
+        }
+    }
+}
+
+/// A JSON number for a rate in kHz, as the reference driver sends it (`48.0`, `44.1`, `22.05`).
+fn khz(rate: u32) -> String {
+    if rate % 1000 == 0 {
+        format!("{}.0", rate / 1000)
+    } else {
+        let s = format!("{:.3}", f64::from(rate) / 1000.0);
+        s.trim_end_matches('0').to_string()
+    }
+}
+
+/// FORK (RichiL10): the OpusHead (RFC 7845 §5.1) for an Opus stream of `channels`, as libopus
+/// lays out its own streams: mapping family 0 for mono/stereo, family 1 with the Vorbis channel
+/// order for 3-8 channels. Synthesized because the Load is composed before the demuxer has read
+/// the file's CodecPrivate; the demuxer logs the file's own header size beside it.
+pub fn opus_head(channels: u32) -> Vec<u8> {
+    let ch = channels.clamp(1, 8) as u8;
+    let mut h = b"OpusHead".to_vec();
+    h.push(1); // version
+    h.push(ch);
+    h.extend_from_slice(&312u16.to_le_bytes()); // pre-skip: libopus's 6.5 ms at 48 kHz
+    h.extend_from_slice(&48_000u32.to_le_bytes()); // input sample rate (informational)
+    h.extend_from_slice(&0i16.to_le_bytes()); // output gain
+    if ch <= 2 {
+        h.push(0);
+    } else {
+        let (streams, coupled, map): (u8, u8, &[u8]) = match ch {
+            3 => (2, 1, &[0, 2, 1]),
+            4 => (2, 2, &[0, 1, 2, 3]),
+            5 => (3, 2, &[0, 4, 1, 2, 3]),
+            6 => (4, 2, &[0, 4, 1, 2, 3, 5]),
+            7 => (4, 3, &[0, 4, 1, 2, 3, 5, 6]),
+            _ => (5, 3, &[0, 6, 1, 2, 3, 4, 5, 7]),
+        };
+        h.push(1);
+        h.push(streams);
+        h.push(coupled);
+        h.extend_from_slice(map);
+    }
+    h
+}
+
+/// The `contents.pcmInfo` / `contents.opusInfo` node for a lane. PURE.
+fn audio_info_node(info: AudioLaneInfo) -> String {
+    match info {
+        AudioLaneInfo::Pcm(s) => format!(
+            r#","pcmInfo":{{"channelMode":"{}","format":"{}","sampleRate":{},"bitsPerSample":{},"layout":"interleaved"}}"#,
+            s.channel_mode(),
+            s.width.format(),
+            khz(s.rate),
+            s.width.bits()
+        ),
+        AudioLaneInfo::Opus { channels } => format!(
+            r#","opusInfo":{{"channels":{channels},"sampleRate":48.0,"streamHeader":"{}"}}"#,
+            plx_base::b64::encode(&opus_head(channels))
+        ),
+    }
+}
+
+/// FORK (RichiL10): splice the lane's info node into `contents`, at the same `provider` anchor
+/// as `DolbyHdrInfo` and `immersive`. PURE. A node is only ever written beside the codec string
+/// it describes, the same consistency rule as the DolbyHdrInfo/H265 guard.
+fn with_audio_info(p: &str, audio: &str, info: Option<AudioLaneInfo>) -> String {
+    let Some(info) = info else {
+        return p.to_string();
+    };
+    if info.payload_codec() != audio {
+        log(&format!("audio: {info:?} NOT spliced, payload audio codec is {audio}"));
+        return p.to_string();
+    }
+    let anchor = r#""provider":"plxnative""#;
+    if !p.contains(anchor) {
+        log("audio: payload has no provider anchor; lane info NOT spliced");
+        return p.to_string();
+    }
+    let node = audio_info_node(info);
+    log(&format!("audio: sourceInfo contents{node}"));
+    p.replace(anchor, &format!("{anchor}{node}"))
+}
 ///
 /// One expression, called from both places, so the two cannot disagree.
 fn app_id_key() -> String {
@@ -1135,6 +1248,8 @@ fn start_bufferfeed_inner(
         return Err(crate::route::RouteStartResult::StartFailed);
     }
     let stream = sample.is_none();
+    // FORK (RichiL10): no PCM declaration survives from an earlier Load; the A/V arm below sets it.
+    crate::ff::declare_pcm(None);
     // For a streamed direct-play/transcode, pick the Load codecs from the item: video H264 vs
     // H265 (native HEVC direct-play), audio AC3/EAC3/AAC/DTS. (The local sample paths keep their
     // fixed payloads.)
@@ -1180,6 +1295,20 @@ fn start_bufferfeed_inner(
                 SHARED.demux_failed.store(true, Ordering::Release);
                 return Err(crate::route::RouteStartResult::StartFailed);
             };
+            // FORK (RichiL10): a PCM/OPUS lane is only declarable with its info node, and the
+            // demuxer must produce exactly the PCM format this Load declares.
+            let lane = crate::route::stream_audio_lane(ps);
+            if matches!(ac, "PCM" | "OPUS") && lane.map(AudioLaneInfo::payload_codec) != Some(ac) {
+                log(&format!(
+                    "start_bufferfeed: no {ac} declaration for {codec:?} (track facts unknown); refusing incorrect Load declaration"
+                ));
+                SHARED.demux_failed.store(true, Ordering::Release);
+                return Err(crate::route::RouteStartResult::StartFailed);
+            }
+            crate::ff::declare_pcm(match lane {
+                Some(AudioLaneInfo::Pcm(spec)) => Some(spec),
+                _ => None,
+            });
             SHARED.dg_load_a.store(diagnostic, Ordering::Relaxed);
             audio_declared = ac;
             // The sink envelope — `adaptiveStreaming`'s maxWidth/maxHeight/maxFrameRate — used
@@ -4994,12 +5123,59 @@ mod sink_envelope_tests {
             assert_eq!(audio_payload_codec(codec), Some(("DTS", 4)), "{codec}");
         }
         assert_eq!(audio_payload_codec("eac3"), Some(("AC3 PLUS", 2)));
-        for codec in ["truehd", "flac", "", "unknown"] {
+        for codec in ["truehd", "", "unknown", "mlp", "vorbis"] {
             assert_eq!(audio_payload_codec(codec), None);
         }
+        // FORK (RichiL10): the fork's lanes.
+        assert_eq!(audio_payload_codec("flac"), Some(("PCM", 5)));
+        assert_eq!(audio_payload_codec("pcm"), Some(("PCM", 5)));
+        assert_eq!(audio_payload_codec("opus"), Some(("OPUS", 6)));
         let ps = crate::route::PlaybackSession::IDLE;
         let payload = build_av_payload(&ps, "H264", "DTS", ENVELOPE_FHD60);
         assert!(payload.contains(r#""audio":"DTS""#));
+    }
+
+    /// FORK (RichiL10): the exact nodes, in the shape of the reference webOS driver
+    /// (moonlight-tv's ss4s `smp_player.c`): sampleRate in kHz, opus header in base64.
+    #[test]
+    fn fork_lane_nodes_are_exact_and_only_beside_their_codec() {
+        let flac24 = AudioLaneInfo::for_track("flac", 48_000, 2, 24, None).unwrap();
+        assert_eq!(
+            audio_info_node(flac24),
+            r#","pcmInfo":{"channelMode":"stereo","format":"S32LE","sampleRate":48.0,"bitsPerSample":32,"layout":"interleaved"}"#
+        );
+        let cd = AudioLaneInfo::for_track("flac", 44_100, 2, 16, None).unwrap();
+        assert!(audio_info_node(cd).contains(r#""format":"S16LE","sampleRate":44.1,"bitsPerSample":16"#));
+        assert!(audio_info_node(AudioLaneInfo::for_track("pcm", 22_050, 1, 16, None).unwrap())
+            .contains(r#""channelMode":"mono","format":"S16LE","sampleRate":22.05"#));
+        let opus = AudioLaneInfo::for_track("opus", 48_000, 2, 0, None).unwrap();
+        assert_eq!(opus, AudioLaneInfo::Opus { channels: 2 });
+        assert_eq!(
+            audio_info_node(opus),
+            format!(r#","opusInfo":{{"channels":2,"sampleRate":48.0,"streamHeader":"{}"}}"#, plx_base::b64::encode(&opus_head(2)))
+        );
+        assert_eq!(AudioLaneInfo::for_track("dca", 48_000, 6, 24, None), None);
+        assert_eq!(AudioLaneInfo::for_track("flac", 0, 2, 24, None), None);
+        // spliced inside `contents`, once, and only beside the matching codec string
+        let p = PAYLOAD_AV.replace(r#""audio":"AC3""#, r#""audio":"PCM""#);
+        let out = with_audio_info(&p, "PCM", Some(flac24));
+        assert_eq!(out.matches("pcmInfo").count(), 1);
+        assert!(out.contains(r#""provider":"plxnative","pcmInfo":{"#));
+        assert_eq!(with_audio_info(&p, "AC3", Some(flac24)), p);
+        assert_eq!(with_audio_info(&p, "PCM", None), p);
+    }
+
+    #[test]
+    fn synthesized_opus_heads_follow_rfc_7845() {
+        let stereo = opus_head(2);
+        assert_eq!(stereo.len(), 19);
+        assert_eq!(&stereo[..8], b"OpusHead");
+        assert_eq!((stereo[8], stereo[9], stereo[18]), (1, 2, 0));
+        assert_eq!(u16::from_le_bytes([stereo[10], stereo[11]]), 312);
+        let surround = opus_head(6);
+        assert_eq!(surround.len(), 21 + 6);
+        assert_eq!(&surround[18..21], &[1, 4, 2]);
+        assert_eq!(&surround[21..], &[0, 4, 1, 2, 3, 5]);
     }
 
     const DEV_SET: ((u32, u32, u32), (u32, u32, u32)) = ((4096, 2304, 60), (4096, 2176, 60));

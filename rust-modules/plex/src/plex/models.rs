@@ -653,6 +653,10 @@ pub struct Stream {
     pub chroma_subsampling: String,
     #[serde(default, deserialize_with = "de_i64")]
     pub channels: i64,
+    /// FORK (RichiL10): audio stream only: `samplingRate` in Hz (48000), 0 = not said. The PCM
+    /// lane declares its rate from it before the demuxer has opened the file.
+    #[serde(rename = "samplingRate", default, deserialize_with = "de_i64")]
+    pub sampling_rate: i64,
     #[serde(rename = "audioChannelLayout", default)]
     pub audio_channel_layout: String,
     #[serde(rename = "displayTitle", default)]

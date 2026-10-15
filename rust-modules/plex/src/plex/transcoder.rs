@@ -205,6 +205,9 @@ fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeD
     // plexplayer.py uses this scope for audio.channels too); audioCodec is not a valid scope.
     let audio_limits = caps.audio_channels.iter()
         .filter(|(codec, _)| caps.audio_has(codec))
+        // FORK (RichiL10): the stated bound, which for DTS admits the 6.1/7.1 tracks whose core
+        // the demuxer feeds (`Caps::profile_channel_limit`).
+        .map(|(codec, raw)| (codec, caps.profile_channel_limit(codec).unwrap_or(*raw)))
         .map(|(codec, channels)| format!(
             "+add-limitation(scope=videoAudioCodec&scopeName={codec}&type=upperBound&name=audio.channels&value={channels}&replace=true)"
         ))
@@ -1235,14 +1238,17 @@ mod tests {
         let profile = super::profile_for(&caps);
         assert!(list_of(&profile, "audioCodec=").contains(&"dts".into()));
         assert!(list_of(target_of(&profile), "audioCodec=").contains(&"dts".into()));
-        assert!(profile.contains("scope=videoAudioCodec&scopeName=dts&type=upperBound&name=audio.channels&value=6&replace=true"));
+        // FORK (RichiL10): the device row says 6, but the demuxer feeds a DTS-HD track's core, so
+        // PMS may direct-play 6.1/7.1 DTS-HD (the `dts_core=never` knob restores 6).
+        assert!(profile.contains("scope=videoAudioCodec&scopeName=dts&type=upperBound&name=audio.channels&value=8&replace=true"));
         assert!(!profile.contains("truehd"));
     }
 
     #[test]
     fn force_profile_advertises_engine_formats_without_device_limits_or_transcode() {
         let p = super::forced_direct_profile();
-        assert_eq!(list_of(&p, "audioCodec="), ["aac", "ac3", "eac3", "dts"]);
+        // FORK (RichiL10): plus the fork's PCM lane (flac, pcm) and native Opus.
+        assert_eq!(list_of(&p, "audioCodec="), ["aac", "ac3", "eac3", "dts", "flac", "pcm", "opus"]);
         assert_eq!(list_of(&p, "videoCodec="), ["h264", "hevc"]);
         assert!(!p.contains("add-limitation"));
         assert!(!p.contains("transcode-target"));

@@ -109,6 +109,13 @@ SAME64(offsetof(AVFrame, format), 116, "OFF_FRAME_FORMAT != 80 [host]");
    the reason the FFmpeg 9 bump did not ship a wrong PTS: it fired here, on a desk. */
 SAME32(offsetof(AVFrame, pts), 96, "OFF_FRAME_PTS != 96 (ARM EABI int64 alignment)");
 SAME64(offsetof(AVFrame, pts), 136, "OFF_FRAME_PTS != 96 (ARM EABI int64 alignment) [host]");
+/* FORK (RichiL10): read by the PCM lane's FLAC decode (ff_pcm.rs). */
+SAME32(offsetof(AVFrame, nb_samples), 76, "OFF_AFRAME_NB_SAMPLES != 76");
+SAME64(offsetof(AVFrame, nb_samples), 112, "OFF_AFRAME_NB_SAMPLES != 76 [host]");
+SAME(AV_SAMPLE_FMT_S16, 1, "AV_SAMPLE_FMT_S16 moved");
+SAME(AV_SAMPLE_FMT_S32, 2, "AV_SAMPLE_FMT_S32 moved");
+SAME(AV_SAMPLE_FMT_S16P, 6, "AV_SAMPLE_FMT_S16P moved");
+SAME(AV_SAMPLE_FMT_S32P, 7, "AV_SAMPLE_FMT_S32P moved");
 
 /* --- AVPacket: modelled field-by-field in ff.rs. Never allocated by us (av_packet_alloc does),
        but a short model would be a silent overread. sizeof went 72 -> 80 at FFmpeg 5.0:
