@@ -1251,6 +1251,13 @@ pub struct Plan {
     /// The direct-play declaration resolved from one cached capability snapshot. Payload builds,
     /// reloads and recovery consume this stored answer; remux/transcode leave it at `NONE`.
     pub dv_decision: plx_data::metadata::DvDecision,
+    /// FORK (RichiL10): the SOURCE file's Dolby Vision layering and the direct-play declaration
+    /// frozen for it, set on EVERY branch that reached the DV gate, whatever route this plan
+    /// installs. Installed as the session's item-level facts (`Session::item_dovi`), which no
+    /// route change clears, so a later route that copies the video again (a remux after a burn,
+    /// after HLS, after a quality change) can restore the declaration direct play would make.
+    pub source_dovi: plx_data::metadata::Dovi,
+    pub source_dv_decision: plx_data::metadata::DvDecision,
     /// Does the direct-played audio track carry Dolby Atmos, for the Load payload's
     /// `contents.immersive` node. Set on the DIRECT-PLAY branch only, for the same reason `dovi`
     /// is: it describes the FILE's own elementary stream.
@@ -1454,6 +1461,9 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     #[cfg(not(any(test, feature = "test-support")))]
     let dv_decision = dovi.decision_now(vcodec == "hevc");
     let dv = dv_decision.presentation;
+    // FORK (RichiL10): the item's own DV facts, kept for the whole playback (see `Plan::source_dovi`).
+    plan.source_dovi = dovi;
+    plan.source_dv_decision = dv_decision;
     let video_dp = if forced { video_feed_supported(vcodec, dv) } else {
         video_direct_plays(vcodec, src_w, src_h, dv, plx_platform::devcaps::caps())
     };

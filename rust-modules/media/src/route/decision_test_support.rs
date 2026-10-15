@@ -104,6 +104,9 @@ pub(super) fn fresh_registry(ps: &mut PlaybackSession) -> plx_base::testlock::Se
     // Issue #266: `ResolveEnv::snapshot` reads the enhancement preference from a global, so a
     // test that set it must not leak an enhanced resolve into the next one.
     crate::player::restore_audio_enhancements(plx_plex::plex::AudioEnhancements::NONE);
+    // FORK (RichiL10): the `sub_burn` knob's test seam is per thread; start every case at the conf
+    // file's answer (no file in a host test: the `never4k` default).
+    set_sub_burn_for_test(None);
     crate::player::reset_route_requests_for_test(ps);
     plx_plex::plex::reset_servers_for_test();
     crate::player::clear_original_failure();
