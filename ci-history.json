@@ -1,0 +1,8 @@
+{"updated":"2026-10-15T19:40:58Z",
+"ci":[],
+"sim":[
+{"id":38794974308,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"macOS simulator build + launch":390,"Linux simulator build + launch":357,"macOS tests against bundled FFmpeg and ASS":388,"Windows launcher syntax":20}}
+],
+"nightly":[],
+"cancelled":{},
+"daily":[]}
