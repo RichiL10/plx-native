@@ -2223,8 +2223,10 @@ pub struct Streams {
 /// Load payload before the demuxer opens the file: PMS `samplingRate`, `channels`, `bitDepth`
 /// (0 = not said). Kept OUT of [`Stream`] on purpose: that struct is a recorded wire value whose
 /// recordings must re-serialize byte for byte, and these facts matter to one Load decision only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioFacts {
+    /// PMS codec id, lowercase (lac, dca, 	ruehd, ...).
+    pub codec: String,
     pub rate: i64,
     pub channels: i64,
     pub bit_depth: i64,
@@ -2249,7 +2251,7 @@ fn record_audio_facts(id: i64, facts: AudioFacts) {
 
 /// The facts recorded for PMS audio stream `id`, if its metadata was ever converted.
 pub fn audio_facts(id: i64) -> Option<AudioFacts> {
-    AUDIO_FACTS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied()
+    AUDIO_FACTS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
 }
 
 fn convert_streams(streams: &[plx_plex::plex::Stream]) -> Streams {
@@ -2259,7 +2261,7 @@ fn convert_streams(streams: &[plx_plex::plex::Stream]) -> Streams {
     let mut video: Option<Stream> = None;
     for s in streams {
         if s.stream_type == 2 {
-            record_audio_facts(s.id, AudioFacts { rate: s.sampling_rate, channels: s.channels, bit_depth: s.bit_depth });
+            record_audio_facts(s.id, AudioFacts { codec: s.codec.to_lowercase(), rate: s.sampling_rate, channels: s.channels, bit_depth: s.bit_depth });
         }
         let st = Stream {
             id: s.id,

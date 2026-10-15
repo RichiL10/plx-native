@@ -245,52 +245,79 @@ fn profile_for(caps: &plx_platform::devcaps::Caps) -> String {
 }
 
 // FORK (RichiL10): audio encodes must follow the physical output, not merely the panel's decoder.
-// The complete direct-play list remains in the profile; only the target order changes.
+// The complete direct-play list remains in the profile; only the TARGET audio list changes.
+// Cached for 30 s: a resolve asks for it twice (the decision and the start URL).
 fn sound_output_value() -> String {
-    match plx_platform::tv::sound_output() {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, String)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, value)) = cache.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(30) {
+            return value.clone();
+        }
+    }
+    let value = match plx_platform::tv::sound_output() {
         plx_platform::tv::SoundOutputReply::Reply(raw) => serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.pointer("/settings/soundOutput").and_then(serde_json::Value::as_str).map(str::to_owned))
             .unwrap_or_else(|| "unknown".to_owned()),
         _ => "unknown".to_owned(),
-    }
-}
-
-fn audio_encode_targets(caps: &plx_platform::devcaps::Caps) -> (String, String) {
-    let output = sound_output_value();
-    let requested = plx_base::forkknobs::get("encode_audio");
-    let optical = output.to_ascii_lowercase().contains("optical");
-    let preferred = match requested.as_deref() {
-        Some("ac3") => ["ac3", "eac3"],
-        Some("eac3") => ["eac3", "ac3"],
-        _ if optical => ["ac3", "eac3"],
-        _ => ["eac3", "ac3"],
     };
-    let mut codecs = preferred
-        .into_iter()
-        .filter(|codec| caps.audio_has(codec))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for codec in ["aac", "dts"] {
-        if caps.audio_has(codec) && !codecs.iter().any(|current| current == codec) {
-            codecs.push(codec.to_owned());
-        }
-    }
-    if codecs.is_empty() {
-        codecs.push("aac".to_owned());
-    }
-    let list = codecs.join(",");
-    plx_base::eventlog::log(&format!("audio: encode target={list} (sound output={output})"));
-    (list, output)
+    *cache = Some((std::time::Instant::now(), value.clone()));
+    value
 }
 
-fn profile_extra(delivery: TranscodeDelivery) -> String {
+/// FORK (RichiL10): the transcode TARGET's audio list for one request. PURE over its inputs.
+///
+/// PMS encodes into the first listed codec that can carry the source's channel count — measured:
+/// with `ac3,eac3,aac,dts` it turned FLAC 7.1 into E-AC3 7.1 and FLAC 2.0 into AAC. So:
+/// * `Encode` (the TV cannot decode the track): ONLY what should leave the server. On an optical
+///   (S/PDIF) output that is AC3 alone: optical carries Dolby Digital 5.1 at most, and DD+ would
+///   be decoded and re-encoded to DD by the TV, a second lossy pass. Elsewhere `eac3,ac3`, which
+///   keeps up to 7.1. Knob `encode_audio=ac3|eac3` overrides.
+/// * `CopyLane(codec)`: the fork-lane track is named first so the remux copies it.
+/// * `Unknown`: the established copy-lane list, AC3-first on optical, E-AC3-first elsewhere.
+fn target_audio(
+    caps: &plx_platform::devcaps::Caps,
+    target: super::params::AudioTarget,
+    output: &str,
+    knob: Option<&str>,
+) -> String {
+    use super::params::AudioTarget;
+    let optical = output.to_ascii_lowercase().contains("optical");
+    let has = |c: &&str| caps.audio_has(c);
+    let lanes: Vec<&str> = if optical || knob == Some("ac3") {
+        ["ac3", "eac3", "aac", "dts"].into_iter().filter(has).collect()
+    } else {
+        ["eac3", "ac3", "aac", "dts"].into_iter().filter(has).collect()
+    };
+    let list: Vec<&str> = match target {
+        AudioTarget::Encode => {
+            let wanted: &[&str] = match knob {
+                Some("ac3") => &["ac3"],
+                Some("eac3") => &["eac3", "ac3"],
+                _ if optical => &["ac3"],
+                _ => &["eac3", "ac3"],
+            };
+            let chosen: Vec<&str> = wanted.iter().copied().filter(has).collect();
+            if chosen.is_empty() { lanes } else { chosen }
+        }
+        AudioTarget::CopyLane(codec) if caps.audio_has(codec) => {
+            std::iter::once(codec).chain(lanes).collect()
+        }
+        _ => lanes,
+    };
+    if list.is_empty() { "aac".to_owned() } else { list.join(",") }
+}
+
+fn profile_extra(delivery: TranscodeDelivery, audio: super::params::AudioTarget) -> String {
     let caps = plx_platform::devcaps::caps();
     let baseline = profile_for_delivery(caps, delivery);
     if matches!(delivery, TranscodeDelivery::FixedHls { .. }) {
         return baseline;
     }
-    let (target_audio, _) = audio_encode_targets(caps);
+    let output = sound_output_value();
+    let list = target_audio(caps, audio, &output, plx_base::forkknobs::get("encode_audio").as_deref());
+    plx_base::eventlog::log(&format!("audio: target={list} for {audio:?} (sound output={output})"));
     let current = ["ac3", "eac3", "aac", "dts"]
         .into_iter()
         .filter(|codec| caps.audio_has(codec))
@@ -301,7 +328,7 @@ fn profile_extra(delivery: TranscodeDelivery) -> String {
         .expect("profile contains its progressive transcode target");
     format!(
         "{before}add-transcode-target{}",
-        target.replacen(&format!("audioCodec={current}"), &format!("audioCodec={target_audio}"), 1),
+        target.replacen(&format!("audioCodec={current}"), &format!("audioCodec={list}"), 1),
     )
 }
 
@@ -429,7 +456,7 @@ impl Client {
         q = self
             .playback_identity(q)
             .str("X-Plex-Client-Profile-Name", "Generic")
-            .str("X-Plex-Client-Profile-Extra", &profile_extra(s.contract.delivery));
+            .str("X-Plex-Client-Profile-Extra", &profile_extra(s.contract.delivery, s.audio_target));
         if let Some(offset) = s.offset.wire_seconds() {
             q = q.str("offset", &offset);
         }
@@ -507,7 +534,7 @@ impl Client {
             .str("X-Plex-Client-Profile-Name", "Generic")
             .str(
                 "X-Plex-Client-Profile-Extra",
-                &if forced { forced_direct_profile() } else { profile_extra(TranscodeDelivery::ProgressiveMkv) },
+                &if forced { forced_direct_profile() } else { profile_extra(TranscodeDelivery::ProgressiveMkv, super::params::AudioTarget::Unknown) },
             );
         self.get_json(&q.build())
     }
@@ -692,6 +719,7 @@ mod tests {
             subtitle_stream_id: 0,
             client_subtitles: false,
             offset: crate::plex::TranscodeOffset::Fresh,
+            audio_target: crate::plex::AudioTarget::Unknown,
         }
     }
 
@@ -1216,7 +1244,7 @@ mod tests {
     /// caps — the same hevc-capable panel this rule was written on.
     #[test]
     fn the_transcode_target_never_strands_a_server_without_plex_pass() {
-        let p = super::profile_extra(super::TranscodeDelivery::ProgressiveMkv);
+        let p = super::profile_extra(super::TranscodeDelivery::ProgressiveMkv, super::super::params::AudioTarget::Unknown);
         let target = target_of(&p);
         let video = list_of(target, "videoCodec=");
         assert!(video.contains(&"h264".to_string()),
@@ -1253,6 +1281,32 @@ mod tests {
         assert!(!p.contains("add-limitation"));
         assert!(!p.contains("transcode-target"));
         assert!(!p.contains("truehd"));
+    }
+
+    /// FORK (RichiL10): the per-request target audio list. PMS encodes into the first listed codec
+    /// that carries the source's channels, so an encode lists ONLY what should leave the server.
+    #[test]
+    fn target_audio_encodes_for_the_sound_output_and_copies_fork_lanes() {
+        use super::super::params::AudioTarget;
+        let mut caps = Caps::assumed();
+        caps.audio = "aac,ac3,eac3,dts,flac,pcm,opus".into();
+        let t = |target, output, knob| super::target_audio(&caps, target, output, knob);
+        // optical: AC3 only (DD 5.1 is the most S/PDIF carries; DD+ would be re-encoded by the TV)
+        assert_eq!(t(AudioTarget::Encode, "external_optical", None), "ac3");
+        assert_eq!(t(AudioTarget::Encode, "external_arc", None), "eac3,ac3");
+        assert_eq!(t(AudioTarget::Encode, "unknown", None), "eac3,ac3");
+        assert_eq!(t(AudioTarget::Encode, "external_arc", Some("ac3")), "ac3");
+        assert_eq!(t(AudioTarget::Encode, "external_optical", Some("eac3")), "eac3,ac3");
+        // a fork-lane track the remux should copy is named first
+        assert_eq!(t(AudioTarget::CopyLane("flac"), "external_optical", None), "flac,ac3,eac3,aac,dts");
+        // unknown track: the established copy lanes, ordered by output
+        assert_eq!(t(AudioTarget::Unknown, "external_optical", None), "ac3,eac3,aac,dts");
+        assert_eq!(t(AudioTarget::Unknown, "tv_speaker", None), "eac3,ac3,aac,dts");
+        assert_eq!(t(AudioTarget::CopyLane("flac"), "x", None), "flac,eac3,ac3,aac,dts");
+        // a lane the device does not admit is never named
+        let plain = Caps::assumed();
+        assert_eq!(super::target_audio(&plain, AudioTarget::CopyLane("flac"), "x", None), "eac3,ac3,aac");
+        assert_eq!(super::target_audio(&plain, AudioTarget::Encode, "external_optical", None), "ac3");
     }
 
     /// The other side of issue #22's fallback-chain rule: on a SoC whose table has no HEVC row,

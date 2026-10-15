@@ -409,6 +409,29 @@ pub(super) fn transcode_spec_carrying_burn<'a>(
         subtitle_stream_id: sub,
         client_subtitles,
         offset,
+        audio_target: audio_target_of(aud),
+    }
+}
+
+/// FORK (RichiL10): how the transcode target must treat the selected track `aud`, from the facts
+/// PMS reported for it (`metadata::audio_facts`). `Unknown` for the server-default track (0) and
+/// for a track whose metadata was never read, which keeps the established list.
+fn audio_target_of(aud: i64) -> plx_plex::plex::AudioTarget {
+    use plx_plex::plex::AudioTarget;
+    let Some(facts) = (aud > 0).then(|| plx_data::metadata::audio_facts(aud)).flatten() else {
+        return AudioTarget::Unknown;
+    };
+    if facts.codec.is_empty() {
+        return AudioTarget::Unknown;
+    }
+    if !plx_plex::plex::is_dp_audio_track(&facts.codec, facts.channels) {
+        return AudioTarget::Encode;
+    }
+    match plx_platform::devcaps::dp_audio_key(&facts.codec) {
+        "flac" => AudioTarget::CopyLane("flac"),
+        "pcm" => AudioTarget::CopyLane("pcm"),
+        "opus" => AudioTarget::CopyLane("opus"),
+        _ => AudioTarget::Unknown,
     }
 }
 
@@ -809,6 +832,16 @@ fn decision_audio(mc: &plx_plex::plex::MediaContainer) -> Option<&str> {
         .first()
         .and_then(|m| m.first_part())
         .and_then(|p| p.stream.iter().find(|s| s.stream_type == 2))
+        .map(|s| s.decision.as_str())
+}
+
+/// FORK (RichiL10): the VIDEO lane's stream decision off a `/decision` body (`copy` on a remux
+/// that leaves the source bitstream untouched), if it says.
+pub(super) fn decision_video(mc: &plx_plex::plex::MediaContainer) -> Option<&str> {
+    mc.metadata
+        .first()
+        .and_then(|m| m.first_part())
+        .and_then(|p| p.stream.iter().find(|s| s.stream_type == 1))
         .map(|s| s.decision.as_str())
 }
 
@@ -2268,6 +2301,27 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
         if let Some((v, a)) = decision_codecs(&mc) {
             plan.vcodec = v;
             plan.acodec = a;
+        }
+        // FORK (RichiL10): a remux whose VIDEO lane the server copies carries the source HEVC
+        // bitstream, Dolby Vision RPUs included (PMS 1.43.4: `-codec:0 copy`, no filter), so it is
+        // declared exactly as direct play would declare it; ff.rs re-arms the P7 -> P8.1
+        // conversion from this frozen decision when the remuxed Matroska lost its DOVI record.
+        // Anything but a confirmed copy keeps declaring nothing.
+        if remux
+            && plx_base::forkknobs::is("remux_dv", "on", "on")
+            && decision_video(&mc) == Some("copy")
+            && plan.vcodec.eq_ignore_ascii_case("hevc")
+            && dv_decision.presentation.declared().is_some()
+        {
+            plan.dovi = dovi;
+            plan.dv_decision = dv_decision;
+            crate::player::log(&format!(
+                "route: remux keeps Dolby Vision (P{}{}, video copy)",
+                dovi.profile,
+                if dovi.converts_to_p81() { "->8.1" } else { "" },
+            ));
+        } else if remux && decision_video(&mc) == Some("transcode") {
+            crate::player::log("route: WARNING the server re-encodes the video of a remux request");
         }
     }
     plan.url = client.transcode_start_url(&sp).to_url();

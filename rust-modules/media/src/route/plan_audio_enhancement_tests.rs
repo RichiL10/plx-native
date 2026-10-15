@@ -230,9 +230,11 @@ fn dv_declared_p8_usable_base_is_enhanced_remux_without_dv() {
         "precondition: the P8 direct play would have declared DolbyHdrInfo",
     );
     assert_enhanced(&r);
+    // FORK (RichiL10): the server COPIES the video of this remux, RPUs included, so the fork
+    // declares the same Dolby Vision the direct play would (`remux_dv`, on by default).
     assert!(
-        r.plan.dv_decision.presentation.declared().is_none(),
-        "the remux never carries DolbyHdrInfo — Dolby Vision turns off while the enhancement is on",
+        r.plan.dv_decision.presentation.declared().is_some(),
+        "FORK: a video-copy remux keeps DolbyHdrInfo while the enhancement is on",
     );
     plx_plex::plex::reset_servers_for_test();
 }
