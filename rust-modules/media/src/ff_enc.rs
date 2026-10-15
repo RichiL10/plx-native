@@ -879,8 +879,12 @@ mod tests {
             buf.clear();
             for i in start..start + per_packet {
                 for c in 0..8 {
-                    let ph = (i as f64) * 2.0 * std::f64::consts::PI * (220.0 * (c + 1) as f64) / 48_000.0;
-                    let v = (ph.sin() * 0.5 * f64::from(i32::MAX)) as i32;
+                    // An integer triangle wave per channel, period 48000 / (220 * (c + 1))
+                    // samples at half scale: no libm call (`ci/allow/libm.txt` only shrinks).
+                    let period = (48_000 / (220 * (c + 1))) as i64;
+                    let (p, half) = ((i as i64) % period, period / 2);
+                    let tri = if p < half { p } else { period - p };
+                    let v = ((tri * 2 - half) * (i64::from(i32::MAX) / 2) / half.max(1)) as i32;
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
