@@ -850,6 +850,10 @@ pub enum AudioLaneInfo {
     Pcm(crate::ff::PcmSpec),
     /// Opus fed as-is: `codec.audio = "OPUS"` + `contents.opusInfo`.
     Opus { channels: u32 },
+    /// FLAC/PCM above the PCM lane's channels, or TrueHD/MLP, encoded in-app to AC3 5.1 48 kHz
+    /// (`ff_enc.rs`): declared exactly as a native AC3 5.1 track, `codec.audio = "AC3"` and no
+    /// info node.
+    Ac3Encode(crate::ff::EncSpec),
 }
 
 impl AudioLaneInfo {
@@ -857,6 +861,34 @@ impl AudioLaneInfo {
     /// `samplingRate`, `channels`, `bitDepth`). `None` for every codec the pipeline decodes
     /// itself, and for a lane codec whose facts are missing (the caller refuses that Load).
     pub fn for_track(acodec: &str, rate: i64, channels: i64, bit_depth: i64, pcm_hi: Option<&str>) -> Option<AudioLaneInfo> {
+        Self::for_track_with(
+            plx_platform::devcaps::caps(),
+            plx_platform::devcaps::encode_lane_on(),
+            acodec,
+            rate,
+            channels,
+            bit_depth,
+            pcm_hi,
+        )
+    }
+
+    /// [`AudioLaneInfo::for_track`] against explicit caps and `encode` knob (pure, for tests).
+    /// FORK (RichiL10): a track the encode lane takes (`Caps::enc_lane_candidate`) is declared AC3
+    /// at 48 kHz only — at any other rate, or with the rate unknown, there is no declaration and
+    /// the Load is refused rather than fed at the wrong rate.
+    pub fn for_track_with(
+        caps: &plx_platform::devcaps::Caps,
+        encode: bool,
+        acodec: &str,
+        rate: i64,
+        channels: i64,
+        bit_depth: i64,
+        pcm_hi: Option<&str>,
+    ) -> Option<AudioLaneInfo> {
+        if caps.enc_lane_candidate(acodec, channels, encode) {
+            return (rate == plx_platform::devcaps::ENC_LANE_RATE)
+                .then(|| AudioLaneInfo::Ac3Encode(crate::ff::EncSpec { channels: channels.max(0) as u32 }));
+        }
         match plx_platform::devcaps::dp_audio_key(acodec) {
             "flac" | "pcm" => crate::ff::PcmSpec::for_track(rate, channels, bit_depth, pcm_hi).map(AudioLaneInfo::Pcm),
             "opus" if (1..=8).contains(&channels) => Some(AudioLaneInfo::Opus { channels: channels as u32 }),
@@ -869,7 +901,18 @@ impl AudioLaneInfo {
         match self {
             AudioLaneInfo::Pcm(_) => "PCM",
             AudioLaneInfo::Opus { .. } => "OPUS",
+            AudioLaneInfo::Ac3Encode(_) => "AC3",
         }
+    }
+}
+
+/// FORK (RichiL10): the Load's `codec.audio` and diagnostic code for the route's output codec,
+/// given the lane it takes. An encode-lane track is declared exactly as a native AC3 track
+/// (`audio_payload_codec("ac3")`), whatever its source codec; every other track as before.
+fn load_audio_codec(codec: &str, lane: Option<AudioLaneInfo>) -> Option<(&'static str, u8)> {
+    match lane {
+        Some(AudioLaneInfo::Ac3Encode(_)) => audio_payload_codec("ac3"),
+        _ => audio_payload_codec(codec),
     }
 }
 
@@ -928,6 +971,8 @@ fn audio_info_node(info: AudioLaneInfo) -> String {
             r#","opusInfo":{{"channels":{channels},"sampleRate":48.0,"streamHeader":"{}"}}"#,
             plx_base::b64::encode(&opus_head(channels))
         ),
+        // FORK (RichiL10): a native-looking AC3 track carries no info node.
+        AudioLaneInfo::Ac3Encode(_) => String::new(),
     }
 }
 
@@ -938,6 +983,10 @@ fn with_audio_info(p: &str, audio: &str, info: Option<AudioLaneInfo>) -> String 
     let Some(info) = info else {
         return p.to_string();
     };
+    // FORK (RichiL10): the encode lane is declared as plain AC3: nothing to splice.
+    if matches!(info, AudioLaneInfo::Ac3Encode(_)) {
+        return p.to_string();
+    }
     if info.payload_codec() != audio {
         log(&format!("audio: {info:?} NOT spliced, payload audio codec is {audio}"));
         return p.to_string();
@@ -1250,6 +1299,7 @@ fn start_bufferfeed_inner(
     let stream = sample.is_none();
     // FORK (RichiL10): no PCM declaration survives from an earlier Load; the A/V arm below sets it.
     crate::ff::declare_pcm(None);
+    crate::ff::declare_enc(None);
     // For a streamed direct-play/transcode, pick the Load codecs from the item: video H264 vs
     // H265 (native HEVC direct-play), audio AC3/EAC3/AAC/DTS. (The local sample paths keep their
     // fixed payloads.)
@@ -1290,14 +1340,16 @@ fn start_bufferfeed_inner(
             // wrong string leaves the audio ES unconfigured, and with audioSync the video
             // sink slaves to the dead audio clock and stalls (verified: video-only plays).
             let codec = crate::route::stream_acodec(ps);
-            let Some((ac, diagnostic)) = audio_payload_codec(&codec) else {
+            // FORK (RichiL10): the fork lane decides the declaration first: an encode-lane track
+            // (FLAC/PCM above the PCM lane, TrueHD/MLP) is declared as the AC3 it becomes.
+            let lane = crate::route::stream_audio_lane(ps);
+            let Some((ac, diagnostic)) = load_audio_codec(&codec, lane) else {
                 log(&format!("start_bufferfeed: unsupported audio codec {codec:?}; refusing incorrect Load declaration"));
                 SHARED.demux_failed.store(true, Ordering::Release);
                 return Err(crate::route::RouteStartResult::StartFailed);
             };
             // FORK (RichiL10): a PCM/OPUS lane is only declarable with its info node, and the
             // demuxer must produce exactly the PCM format this Load declares.
-            let lane = crate::route::stream_audio_lane(ps);
             if matches!(ac, "PCM" | "OPUS") && lane.map(AudioLaneInfo::payload_codec) != Some(ac) {
                 log(&format!(
                     "start_bufferfeed: no {ac} declaration for {codec:?} (track facts unknown); refusing incorrect Load declaration"
@@ -1307,6 +1359,13 @@ fn start_bufferfeed_inner(
             }
             crate::ff::declare_pcm(match lane {
                 Some(AudioLaneInfo::Pcm(spec)) => Some(spec),
+                _ => None,
+            });
+            crate::ff::declare_enc(match lane {
+                Some(AudioLaneInfo::Ac3Encode(spec)) => {
+                    log(&format!("start_bufferfeed: {codec} {}ch -> AC3 5.1 encode lane (declared AC3)", spec.channels));
+                    Some(spec)
+                }
                 _ => None,
             });
             SHARED.dg_load_a.store(diagnostic, Ordering::Relaxed);
@@ -5163,6 +5222,44 @@ mod sink_envelope_tests {
         assert!(out.contains(r#""provider":"plxnative","pcmInfo":{"#));
         assert_eq!(with_audio_info(&p, "AC3", Some(flac24)), p);
         assert_eq!(with_audio_info(&p, "PCM", None), p);
+    }
+
+    /// FORK (RichiL10): an encode-lane track (FLAC/PCM above the PCM lane, TrueHD) is declared
+    /// EXACTLY as a native AC3 5.1 48 kHz track: `codec.audio` "AC3", diagnostic 1, no info node.
+    #[test]
+    fn encode_lane_tracks_are_declared_as_native_ac3() {
+        let mut b4 = plx_platform::devcaps::Caps::assumed();
+        b4.audio = "aac,ac3,eac3,dts,flac,pcm,opus".into();
+        for (c, n) in [("ac3", 6), ("eac3", 8), ("dts", 6), ("flac", 2), ("pcm", 2), ("opus", 6)] {
+            b4.audio_channels.insert(c.into(), n);
+        }
+        let lane = |codec: &str, rate: i64, ch: i64, encode: bool| {
+            AudioLaneInfo::for_track_with(&b4, encode, codec, rate, ch, 24, None)
+        };
+        for (codec, ch) in [("flac", 8), ("flac", 6), ("pcm", 8), ("truehd", 8), ("truehd", 6), ("mlp", 2)] {
+            let info = lane(codec, 48_000, ch, true);
+            assert_eq!(info, Some(AudioLaneInfo::Ac3Encode(crate::ff::EncSpec { channels: ch as u32 })), "{codec} {ch}ch");
+            assert_eq!(load_audio_codec(codec, info), Some(("AC3", 1)), "{codec} {ch}ch");
+            assert_eq!(load_audio_codec(codec, info), audio_payload_codec("ac3"));
+            // the payload is a native AC3 one: nothing spliced
+            let native = PAYLOAD_AV.to_string();
+            assert_eq!(with_audio_info(&native, "AC3", info), native);
+            assert_eq!(audio_info_node(info.unwrap()), "");
+            // any other rate, or the knob off: no encode-lane declaration
+            assert_eq!(lane(codec, 96_000, ch, true), None, "{codec} {ch}ch 96 kHz");
+            assert_ne!(lane(codec, 48_000, ch, false).map(AudioLaneInfo::payload_codec), Some("AC3"));
+        }
+        // with the knob off a TrueHD track has no declaration at all (the Load is refused)
+        assert_eq!(load_audio_codec("truehd", lane("truehd", 48_000, 8, false)), None);
+        // stereo FLAC stays in the lossless PCM lane, at any rate
+        assert!(matches!(lane("flac", 96_000, 2, true), Some(AudioLaneInfo::Pcm(_))));
+        assert_eq!(load_audio_codec("flac", lane("flac", 96_000, 2, true)), Some(("PCM", 5)));
+        // codecs the TV decodes are untouched
+        assert_eq!(lane("ac3", 48_000, 6, true), None);
+        assert_eq!(load_audio_codec("eac3", None), Some(("AC3 PLUS", 2)));
+        // the composed Load says AC3
+        let ps = crate::route::PlaybackSession::IDLE;
+        assert!(build_av_payload(&ps, "H265", "AC3", ENVELOPE_FHD60).contains(r#""audio":"AC3""#));
     }
 
     #[test]

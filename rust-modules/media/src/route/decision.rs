@@ -8701,7 +8701,13 @@ fn remux_output_acodec(
     enhanced: bool, carried: Option<&CarriedAudio>, src_acodec: &str,
 ) -> String {
     let carried = carried.filter(|a| !a.codec.is_empty());
-    if enhanced || carried.is_some_and(|a| !plx_plex::plex::is_dp_audio_track(&a.codec, a.channels)) {
+    // FORK (RichiL10): TrueHD/MLP direct-play through the in-app encode lane, but the transcode
+    // target never lists them, so a remux converts them to its first target (ac3).
+    let server_converts = |a: &CarriedAudio| {
+        !plx_plex::plex::is_dp_audio_track(&a.codec, a.channels)
+            || matches!(plx_platform::devcaps::dp_audio_key(&a.codec), "truehd" | "mlp")
+    };
+    if enhanced || carried.is_some_and(server_converts) {
         "ac3".to_owned()
     } else {
         carried.map_or_else(|| src_acodec.to_owned(), |a| a.codec.clone())

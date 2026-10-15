@@ -22,6 +22,7 @@
 //! | `flac`         | `pcm`, `off`                  | feed: FLAC decoded in-app to PCM, or left to the server |
 //! | `opus`         | `native`, `off`               | feed: Opus fed as-is, or left to the server |
 //! | `dts_core`     | `auto`, `never`               | gate: DTS-HD above the TV's DTS channel ceiling plays as its core (`never` = the server converts it) |
+//! | `encode`       | `ac3`, `off`                  | feed: FLAC/PCM above the PCM lane's channels and TrueHD/MLP (48 kHz) decoded and encoded to AC3 5.1 640 kbps in-app (`off` = the server converts them) |
 //!
 //! The file is re-read when its modification time changes, at most once per second, so a change
 //! takes effect on the next playback without restarting the app.

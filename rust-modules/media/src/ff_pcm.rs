@@ -118,7 +118,8 @@ pub(super) enum SrcFmt {
 }
 
 impl SrcFmt {
-    fn bytes(self) -> usize {
+    // FORK (RichiL10): `bytes`/`read` are shared with the AC3 encode lane (`ff_enc.rs`).
+    pub(super) fn bytes(self) -> usize {
         match self {
             SrcFmt::S16Le | SrcFmt::S16Be => 2,
             SrcFmt::S24Le | SrcFmt::S24Be => 3,
@@ -143,7 +144,7 @@ impl SrcFmt {
 
     /// One sample as a full-scale (MSB-aligned) 32-bit value.
     #[inline]
-    fn read(self, b: &[u8]) -> i32 {
+    pub(super) fn read(self, b: &[u8]) -> i32 {
         match self {
             SrcFmt::S16Le => i32::from(i16::from_le_bytes([b[0], b[1]])) << 16,
             SrcFmt::S16Be => i32::from(i16::from_be_bytes([b[0], b[1]])) << 16,

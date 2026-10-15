@@ -82,6 +82,32 @@ pub fn dts_over_ceiling_admitted() -> bool {
     dts_over_ceiling_for(plx_base::forkknobs::get("dts_core").as_deref())
 }
 
+/// FORK (RichiL10): the only sample rate the AC3 encode lane (`ff::enc`) takes. The bundled
+/// FFmpeg has no resampler (`--disable-swresample`), and 48 kHz keeps the television's AC3 path
+/// on the rate it always plays; any other rate stays with the server.
+pub const ENC_LANE_RATE: i64 = 48_000;
+
+/// FORK (RichiL10): the encode lane's `encode` knob: `ac3` (default) or `off`, which is build 3's
+/// behaviour exactly (those tracks are converted by the server).
+fn encode_lane_for(knob: Option<&str>) -> bool {
+    knob != Some("off")
+}
+
+pub fn encode_lane_on() -> bool {
+    encode_lane_for(plx_base::forkknobs::get("encode").as_deref())
+}
+
+/// FORK (RichiL10): which of the fork's feed lanes a track takes, when the device table alone
+/// does not decide it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioLane {
+    /// FLAC / native PCM inside the PCM lane's admitted channel counts: lossless PCM.
+    Pcm,
+    /// FLAC / native PCM above them, and TrueHD/MLP: decoded, folded to 5.1(side) and encoded to
+    /// AC3 640 kbps in-app (`ff_enc.rs`), fed as AC3.
+    Ac3Encode,
+}
+
 /// The key [`DP_AUDIO_CODECS`] and [`Caps::audio`] know a codec by. PMS reports every DTS
 /// flavour as `dca` (libavcodec's old decoder name) — `dca-ma`, `dca-hra` and friends on a Media
 /// whose track is DTS-HD — while this set, the television's codec table ("DTS") and the bundled
@@ -166,12 +192,30 @@ impl Caps {
 
     /// Local counterpart of the profile's codec-scoped audio.channels limitations.
     pub fn audio_supports(&self, codec: &str, channels: i64) -> bool {
-        self.audio_supports_with(codec, channels, dts_over_ceiling_admitted())
+        self.audio_supports_at(codec, channels, 0)
     }
 
-    /// [`Caps::audio_supports`] with the `dts_core` knob's answer passed in (pure, for tests).
+    /// FORK (RichiL10): [`Caps::audio_supports`] with the track's sample rate (Hz, 0 = not
+    /// known), which the AC3 encode lane needs: it takes 48 kHz only. An unknown rate is admitted
+    /// here, and the Load (which declares from the track's PMS facts) refuses it if it is wrong.
+    pub fn audio_supports_at(&self, codec: &str, channels: i64, rate: i64) -> bool {
+        self.audio_supports_lanes(codec, channels, rate, dts_over_ceiling_admitted(), encode_lane_on())
+    }
+
+    /// [`Caps::audio_supports`] with the `dts_core` knob's answer passed in and the encode lane
+    /// off (pure, for tests): the answers before the encode lane existed.
+    #[cfg(test)]
     fn audio_supports_with(&self, codec: &str, channels: i64, dts_over_ceiling: bool) -> bool {
+        self.audio_supports_lanes(codec, channels, 0, dts_over_ceiling, false)
+    }
+
+    /// The whole rule, every knob passed in (pure).
+    fn audio_supports_lanes(&self, codec: &str, channels: i64, rate: i64, dts_over_ceiling: bool, encode: bool) -> bool {
         let codec = dp_audio_key(codec);
+        // FORK (RichiL10): a track the encode lane takes is direct-playable at 48 kHz.
+        if self.enc_lane_candidate(codec, channels, encode) {
+            return rate == 0 || rate == ENC_LANE_RATE;
+        }
         if !self.audio_has(codec) {
             return false;
         }
@@ -189,12 +233,81 @@ impl Caps {
         }
     }
 
+    /// FORK (RichiL10): can this television take the encode lane's OUTPUT at all? AC3 5.1, from
+    /// a MEASURED AC3 row of at least six channels (like every other fork lane, never assumed).
+    fn enc_sink_ok(&self) -> bool {
+        self.audio_has("ac3") && self.audio_channels.get("ac3").is_some_and(|&l| l >= 6)
+    }
+
+    /// FORK (RichiL10): the PCM lane's own admission for a FLAC / native PCM track: the codec is
+    /// admitted, the channel count is one the lane declares, and it fits the device's row.
+    fn pcm_lane_admits(&self, codec: &str, channels: i64) -> bool {
+        self.audio_has(codec)
+            && pcm_lane_channels_ok(channels)
+            && self.audio_channels.get(codec).is_some_and(|&l| channels <= i64::from(l))
+    }
+
+    /// FORK (RichiL10): would this track take the AC3 encode lane, its sample rate aside?
+    ///
+    /// | track | lane |
+    /// |---|---|
+    /// | FLAC/PCM inside the PCM lane's admitted channel counts | PCM lane (lossless) |
+    /// | FLAC/PCM with 3 to 8 channels the PCM lane does not admit | encode lane |
+    /// | TrueHD/MLP, any channel count | encode lane |
+    ///
+    /// FLAC/PCM follow their own admission (`flac=off` hands them back to the server too); TrueHD
+    /// and MLP are not in any television's table and need only the AC3 sink.
+    pub fn enc_lane_candidate(&self, codec: &str, channels: i64, encode: bool) -> bool {
+        if !encode || !self.enc_sink_ok() {
+            return false;
+        }
+        match dp_audio_key(codec) {
+            "truehd" | "mlp" => channels >= 0,
+            c @ ("flac" | "pcm") => {
+                self.audio_has(c) && (3..=8).contains(&channels) && !self.pcm_lane_admits(c, channels)
+            }
+            _ => false,
+        }
+    }
+
+    /// FORK (RichiL10): the fork lane for a track of `rate` Hz (0 = not known), or `None` for a
+    /// codec the television decodes itself or a track no lane takes. Pure; `encode` is the knob.
+    pub fn audio_lane(&self, codec: &str, channels: i64, rate: i64, encode: bool) -> Option<AudioLane> {
+        if self.enc_lane_candidate(codec, channels, encode) {
+            return (rate == 0 || rate == ENC_LANE_RATE).then_some(AudioLane::Ac3Encode);
+        }
+        let codec = dp_audio_key(codec);
+        (matches!(codec, "flac" | "pcm") && self.pcm_lane_admits(codec, channels)).then_some(AudioLane::Pcm)
+    }
+
+    /// FORK (RichiL10): the codecs the encode lane adds to the PMS direct-play profile beyond
+    /// [`Caps::audio`] (TrueHD and MLP, which no television table lists). Empty when it is off.
+    pub fn enc_lane_profile_codecs(&self, encode: bool) -> &'static [&'static str] {
+        if encode && self.enc_sink_ok() {
+            &["truehd", "mlp"]
+        } else {
+            &[]
+        }
+    }
+
     /// FORK (RichiL10): the `audio.channels` upper bound the PMS profile states for `codec`, or
     /// None for no limitation. The device row, except DTS while its above-ceiling tracks are
     /// admitted: then PMS must be allowed to direct-play a 7.1 DTS-HD track (8 channels), because
     /// the app feeds its core.
     pub fn profile_channel_limit(&self, codec: &str) -> Option<u32> {
+        self.profile_channel_limit_with(codec, encode_lane_on())
+    }
+
+    /// [`Caps::profile_channel_limit`] with the `encode` knob passed in: while the encode lane is
+    /// on, FLAC and PCM (when admitted at all) and TrueHD/MLP are stated up to 8 channels, so
+    /// MDE answers direct play for the tracks the app now converts itself.
+    pub fn profile_channel_limit_with(&self, codec: &str, encode: bool) -> Option<u32> {
         let codec = dp_audio_key(codec);
+        if encode && self.enc_sink_ok() {
+            if matches!(codec, "truehd" | "mlp") || (matches!(codec, "flac" | "pcm") && self.audio_has(codec)) {
+                return Some(8);
+            }
+        }
         let limit = self.audio_channels.get(codec).copied()?;
         if codec == "dts" && dts_over_ceiling_admitted() {
             Some(limit.max(8))
@@ -462,14 +575,17 @@ fn with_fork_knobs(mut caps: Caps, flac: Option<&str>, opus: Option<&str>) -> Ca
         plx_base::eventlog::log(&format!("devcaps: fork knobs -> audio={}", caps.audio));
     }
     let lane = |c: &str| caps.audio_channels.get(c).map_or(0, |v| *v);
-    if caps.audio_has("flac") || caps.audio_has("pcm") || caps.audio_has("opus") {
+    let enc = encode_lane_on() && !caps.enc_lane_profile_codecs(true).is_empty();
+    if caps.audio_has("flac") || caps.audio_has("pcm") || caps.audio_has("opus") || enc {
         plx_base::eventlog::log(&format!(
-            "devcaps: fork lanes flac<={} pcm<={} opus<={} dts<={} (dts above it: {})",
+            "devcaps: fork lanes flac<={} pcm<={} opus<={} dts<={} (dts above it: {}) {}",
             lane("flac"),
             lane("pcm"),
             lane("opus"),
             lane("dts"),
             if dts_over_ceiling_admitted() { "core" } else { "server" },
+            // FORK (RichiL10): the AC3 encode lane (`ff_enc.rs`).
+            if enc { "enc ac3<=8 (flac,pcm,truehd)" } else { "enc off" },
         ));
     }
     caps
@@ -801,10 +917,67 @@ mod tests {
         assert!(c.audio_supports_with("dca-ma", 7, true));
         assert!(c.audio_supports_with("dca", 8, true));
         assert!(!c.audio_supports_with("dca-ma", 7, false));
-        assert_eq!(c.profile_channel_limit("flac"), Some(2));
-        assert_eq!(c.profile_channel_limit("pcm"), Some(2));
-        assert_eq!(c.profile_channel_limit("opus"), Some(6));
-        assert_eq!(c.profile_channel_limit("truehd"), None);
+        assert_eq!(c.profile_channel_limit_with("flac", false), Some(2));
+        assert_eq!(c.profile_channel_limit_with("pcm", false), Some(2));
+        assert_eq!(c.profile_channel_limit_with("opus", false), Some(6));
+        assert_eq!(c.profile_channel_limit_with("truehd", false), None);
+    }
+
+    /// FORK (RichiL10): the AC3 encode lane on the B4. FLAC/PCM the PCM lane cannot declare and
+    /// TrueHD/MLP become direct-playable at 48 kHz; any other rate, and `encode=off`, keep the
+    /// answers above.
+    #[test]
+    fn the_b4_table_admits_the_encode_lane_at_48_khz_only() {
+        let c = parse(B4).unwrap();
+        let on = |codec: &str, ch: i64, rate: i64| c.audio_supports_lanes(codec, ch, rate, true, true);
+        let off = |codec: &str, ch: i64, rate: i64| c.audio_supports_lanes(codec, ch, rate, true, false);
+        for (codec, ch) in [("flac", 8), ("flac", 6), ("flac", 3), ("pcm", 8), ("pcm", 6), ("truehd", 8), ("truehd", 6), ("mlp", 2)] {
+            assert!(on(codec, ch, 48_000), "{codec} {ch}ch at 48 kHz: encode lane");
+            assert!(on(codec, ch, 0), "{codec} {ch}ch, rate not said: admitted, the Load decides");
+            assert!(!on(codec, ch, 96_000), "{codec} {ch}ch at 96 kHz stays with the server");
+            assert!(!on(codec, ch, 44_100), "{codec} {ch}ch at 44.1 kHz: no resampler");
+            assert!(!off(codec, ch, 48_000), "{codec} {ch}ch with encode=off: the server, as in build 3");
+        }
+        // inside the PCM lane nothing changes, whatever the rate
+        assert!(on("flac", 2, 96_000) && on("flac", 1, 44_100) && on("pcm", 2, 48_000));
+        assert_eq!(c.audio_lane("flac", 2, 96_000, true), Some(AudioLane::Pcm));
+        assert_eq!(c.audio_lane("flac", 8, 48_000, true), Some(AudioLane::Ac3Encode));
+        assert_eq!(c.audio_lane("truehd", 8, 48_000, true), Some(AudioLane::Ac3Encode));
+        assert_eq!(c.audio_lane("truehd", 8, 96_000, true), None);
+        assert_eq!(c.audio_lane("flac", 8, 48_000, false), None);
+        assert_eq!(c.audio_lane("ac3", 6, 48_000, true), None);
+        assert_eq!(c.audio_lane("dca-ma", 8, 48_000, true), None, "DTS-HD keeps its core lane");
+        // more than 8 channels is no lane at all; neither is a codec the TV decodes itself
+        assert!(!on("flac", 9, 48_000) && !on("vorbis", 6, 48_000));
+        assert!(on("eac3", 8, 48_000) && on("ac3", 6, 48_000));
+        // the profile states 8 for the lane's codecs while it is on, the old rows when it is off
+        for codec in ["flac", "pcm", "truehd", "mlp"] {
+            assert_eq!(c.profile_channel_limit_with(codec, true), Some(8), "{codec}");
+        }
+        assert_eq!(c.profile_channel_limit_with("opus", true), Some(6));
+        assert_eq!(c.enc_lane_profile_codecs(true), ["truehd", "mlp"]);
+        assert!(c.enc_lane_profile_codecs(false).is_empty());
+        // flac=off hands FLAC back to the server in both lanes
+        let no_flac = with_fork_knobs(c.clone(), Some("off"), None);
+        assert!(!no_flac.audio_supports_lanes("flac", 8, 48_000, true, true));
+        assert!(no_flac.audio_supports_lanes("truehd", 8, 48_000, true, true));
+        assert!(encode_lane_for(None) && encode_lane_for(Some("ac3")) && !encode_lane_for(Some("off")));
+    }
+
+    /// FORK (RichiL10): the encode lane needs a MEASURED AC3 5.1 sink, like every fork lane.
+    #[test]
+    fn the_encode_lane_needs_a_measured_ac3_sink() {
+        let assumed = Caps::assumed();
+        assert!(!assumed.audio_supports_lanes("truehd", 8, 48_000, true, true), "no AC3 row: no lane");
+        assert!(assumed.enc_lane_profile_codecs(true).is_empty());
+        let stereo_ac3 = parse(&B4.replace(r#""AC3", "channels" : 6"#, r#""AC3", "channels" : 2"#)).unwrap();
+        assert!(!stereo_ac3.audio_supports_lanes("flac", 8, 48_000, true, true));
+        // a wider PCM row moves 6-channel FLAC/PCM back into the lossless lane
+        let wide = parse(&B4.replace(r#""PCM", "channels" : 2"#, r#""PCM", "channels" : 6"#)
+            .replace(r#""LPCM", "channels" : 2"#, r#""LPCM", "channels" : 6"#))
+            .unwrap();
+        assert_eq!(wide.audio_lane("pcm", 6, 96_000, true), Some(AudioLane::Pcm));
+        assert_eq!(wide.audio_lane("pcm", 8, 48_000, true), Some(AudioLane::Ac3Encode));
     }
 
     #[test]
