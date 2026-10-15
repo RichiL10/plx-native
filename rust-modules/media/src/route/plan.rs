@@ -424,7 +424,7 @@ fn audio_target_of(aud: i64) -> plx_plex::plex::AudioTarget {
     if facts.codec.is_empty() {
         return AudioTarget::Unknown;
     }
-    if !plx_plex::plex::is_dp_audio_track(&facts.codec, facts.channels) {
+    if !plx_plex::plex::is_dp_audio_track_at(&facts.codec, facts.channels, facts.rate) {
         return AudioTarget::Encode;
     }
     match plx_platform::devcaps::dp_audio_key(&facts.codec) {
@@ -1594,7 +1594,7 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     let copy_blocked = forced || no_video_copy;
     let pick_audio = |stand_in: StandIn| {
         let exact = (env.audio_sid > 0).then(|| {
-            tracks.iter().enumerate().find(|(_, t)| t.id == env.audio_sid && eligible(&t.codec, t.channels))
+            tracks.iter().enumerate().find(|(_, t)| t.id == env.audio_sid && eligible(&t.codec, t.channels) && enc_lane_rate_ok(t))
                 .map(|(i, t)| (i as i32, t.codec.to_lowercase(), t.id))
         }).flatten();
         // A forced direct play has no server to convert an unplayable SESSION pick, and naming
@@ -2658,6 +2658,19 @@ fn pick_dp_audio_mode(
         |codec, channels| audio_direct_plays(mode, codec, channels))
 }
 
+/// FORK (RichiL10): a track the in-app AC3 encode lane would take must be 48 kHz (no resampler),
+/// and the eligibility closures see codec and channels only, so the rate is read from the track's
+/// PMS facts (`metadata::audio_facts`). A rate PMS never stated is admitted; the Load, which
+/// declares from the same facts, refuses a wrong one.
+fn enc_lane_rate_ok(s: &plx_data::metadata::Stream) -> bool {
+    let caps = plx_platform::devcaps::caps();
+    if !caps.enc_lane_candidate(&s.codec, s.channels, plx_platform::devcaps::encode_lane_on()) {
+        return true;
+    }
+    let rate = plx_data::metadata::audio_facts(s.id).map_or(0, |f| f.rate);
+    rate == 0 || rate == plx_platform::devcaps::ENC_LANE_RATE
+}
+
 fn pick_dp_audio_eligible(
     tracks: &[plx_data::metadata::Stream], default_acodec: &str, prefs: AudioLangPrefs<'_>,
     session_pick: i64, stand_in: StandIn,
@@ -2673,7 +2686,8 @@ fn pick_dp_audio_eligible(
         };
     }
     let pick = |i: usize| (i as i32, tracks[i].codec.to_lowercase(), tracks[i].id);
-    let dp_at = |s: &plx_data::metadata::Stream| eligible(&s.codec, s.channels);
+    // FORK (RichiL10): plus the encode lane's 48 kHz rule, which needs the track's PMS facts.
+    let dp_at = |s: &plx_data::metadata::Stream| eligible(&s.codec, s.channels) && enc_lane_rate_ok(s);
     if stand_in == StandIn::SameKind {
         return same_kind_pick(tracks, default_acodec, audio_intents(tracks, prefs, session_pick), dp_at).map(pick);
     }

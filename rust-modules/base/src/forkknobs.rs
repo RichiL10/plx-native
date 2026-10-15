@@ -23,6 +23,7 @@
 //! | `opus`         | `native`, `off`               | feed: Opus fed as-is, or left to the server |
 //! | `dts_core`     | `auto`, `never`               | gate: DTS-HD above the TV's DTS channel ceiling plays as its core (`never` = the server converts it) |
 //! | `sub_burn`     | `never4k`, `allow`            | route: never have the server burn a subtitle into a 4K or Dolby Vision source (`allow` = upstream's burn) |
+//! | `encode`       | `ac3`, `off`                  | feed: FLAC/PCM above the PCM lane's channels and TrueHD/MLP (48 kHz) decoded and encoded to AC3 5.1 640 kbps in-app (`off` = the server converts them) |
 //!
 //! The file is re-read when its modification time changes, at most once per second, so a change
 //! takes effect on the next playback without restarting the app.

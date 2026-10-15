@@ -116,6 +116,57 @@ SAME(AV_SAMPLE_FMT_S16, 1, "AV_SAMPLE_FMT_S16 moved");
 SAME(AV_SAMPLE_FMT_S32, 2, "AV_SAMPLE_FMT_S32 moved");
 SAME(AV_SAMPLE_FMT_S16P, 6, "AV_SAMPLE_FMT_S16P moved");
 SAME(AV_SAMPLE_FMT_S32P, 7, "AV_SAMPLE_FMT_S32P moved");
+/* FORK (RichiL10): the AC3 encode lane (ff_enc.rs) writes the encoder's input frame's
+   sample_rate and ch_layout (format and nb_samples are above), and reads the decoded frame's
+   ch_layout for its channel roles. Derived with ci/ffabi-dump.c's two readers against the FFmpeg
+   9.0 headers: `arm-linux-gnueabi-gcc -c` + `nm -S` (ARM EABI, int64 8-aligned) and a host
+   x86_64 build run directly. sample_rate sits after the 8-aligned pts/pkt_dts/... block, so the
+   two widths differ by more than the pointer count ahead of it. */
+SAME32(offsetof(AVFrame, sample_rate), 132, "OFF_AFRAME_SAMPLE_RATE != 132");
+SAME64(offsetof(AVFrame, sample_rate), 180, "OFF_AFRAME_SAMPLE_RATE != 132 [host]");
+SAME32(offsetof(AVFrame, ch_layout), 256, "OFF_AFRAME_CH_LAYOUT != 256");
+SAME64(offsetof(AVFrame, ch_layout), 384, "OFF_AFRAME_CH_LAYOUT != 256 [host]");
+/* The lane reads ch_layout only through av_channel_layout_channel_from_index and writes it only
+   through av_channel_layout_from_string, but its nb_channels (+4, asserted below) is read
+   directly, and the struct's size decides where the next AVFrame field begins. */
+SAME(sizeof(AVChannelLayout), 24, "sizeof(AVChannelLayout) != 24");
+SAME(offsetof(AVChannelLayout, order), 0, "AVChannelLayout.order moved");
+SAME(AV_CHANNEL_ORDER_UNSPEC, 0, "AV_CHANNEL_ORDER_UNSPEC moved");
+/* The channel roles the 5.1(side) fold names (enum AVChannel, the bit positions of AV_CH_*). */
+SAME(AV_CHAN_FRONT_LEFT, 0, "AV_CHAN_FRONT_LEFT moved");
+SAME(AV_CHAN_FRONT_RIGHT, 1, "AV_CHAN_FRONT_RIGHT moved");
+SAME(AV_CHAN_FRONT_CENTER, 2, "AV_CHAN_FRONT_CENTER moved");
+SAME(AV_CHAN_LOW_FREQUENCY, 3, "AV_CHAN_LOW_FREQUENCY moved");
+SAME(AV_CHAN_BACK_LEFT, 4, "AV_CHAN_BACK_LEFT moved");
+SAME(AV_CHAN_BACK_RIGHT, 5, "AV_CHAN_BACK_RIGHT moved");
+SAME(AV_CHAN_FRONT_LEFT_OF_CENTER, 6, "AV_CHAN_FRONT_LEFT_OF_CENTER moved");
+SAME(AV_CHAN_FRONT_RIGHT_OF_CENTER, 7, "AV_CHAN_FRONT_RIGHT_OF_CENTER moved");
+SAME(AV_CHAN_BACK_CENTER, 8, "AV_CHAN_BACK_CENTER moved");
+SAME(AV_CHAN_SIDE_LEFT, 9, "AV_CHAN_SIDE_LEFT moved");
+SAME(AV_CHAN_SIDE_RIGHT, 10, "AV_CHAN_SIDE_RIGHT moved");
+SAME(AV_CHAN_TOP_CENTER, 11, "AV_CHAN_TOP_CENTER moved");
+SAME(AV_CHAN_TOP_FRONT_LEFT, 12, "AV_CHAN_TOP_FRONT_LEFT moved");
+SAME(AV_CHAN_TOP_FRONT_CENTER, 13, "AV_CHAN_TOP_FRONT_CENTER moved");
+SAME(AV_CHAN_TOP_FRONT_RIGHT, 14, "AV_CHAN_TOP_FRONT_RIGHT moved");
+SAME(AV_CHAN_TOP_BACK_LEFT, 15, "AV_CHAN_TOP_BACK_LEFT moved");
+SAME(AV_CHAN_TOP_BACK_CENTER, 16, "AV_CHAN_TOP_BACK_CENTER moved");
+SAME(AV_CHAN_TOP_BACK_RIGHT, 17, "AV_CHAN_TOP_BACK_RIGHT moved");
+SAME(AV_CHAN_STEREO_LEFT, 29, "AV_CHAN_STEREO_LEFT moved");
+SAME(AV_CHAN_STEREO_RIGHT, 30, "AV_CHAN_STEREO_RIGHT moved");
+SAME(AV_CHAN_WIDE_LEFT, 31, "AV_CHAN_WIDE_LEFT moved");
+SAME(AV_CHAN_WIDE_RIGHT, 32, "AV_CHAN_WIDE_RIGHT moved");
+SAME(AV_CHAN_SURROUND_DIRECT_LEFT, 33, "AV_CHAN_SURROUND_DIRECT_LEFT moved");
+SAME(AV_CHAN_SURROUND_DIRECT_RIGHT, 34, "AV_CHAN_SURROUND_DIRECT_RIGHT moved");
+SAME(AV_CHAN_LOW_FREQUENCY_2, 35, "AV_CHAN_LOW_FREQUENCY_2 moved");
+SAME(AV_CHAN_TOP_SIDE_LEFT, 36, "AV_CHAN_TOP_SIDE_LEFT moved");
+SAME(AV_CHAN_TOP_SIDE_RIGHT, 37, "AV_CHAN_TOP_SIDE_RIGHT moved");
+SAME(AV_CHAN_BOTTOM_FRONT_CENTER, 38, "AV_CHAN_BOTTOM_FRONT_CENTER moved");
+SAME(AV_CHAN_BOTTOM_FRONT_LEFT, 39, "AV_CHAN_BOTTOM_FRONT_LEFT moved");
+SAME(AV_CHAN_BOTTOM_FRONT_RIGHT, 40, "AV_CHAN_BOTTOM_FRONT_RIGHT moved");
+SAME(AV_CHAN_SIDE_SURROUND_LEFT, 41, "AV_CHAN_SIDE_SURROUND_LEFT moved");
+SAME(AV_CHAN_SIDE_SURROUND_RIGHT, 42, "AV_CHAN_SIDE_SURROUND_RIGHT moved");
+SAME(AV_CHAN_TOP_SURROUND_LEFT, 43, "AV_CHAN_TOP_SURROUND_LEFT moved");
+SAME(AV_CHAN_TOP_SURROUND_RIGHT, 44, "AV_CHAN_TOP_SURROUND_RIGHT moved");
 
 /* --- AVPacket: modelled field-by-field in ff.rs. Never allocated by us (av_packet_alloc does),
        but a short model would be a silent overread. sizeof went 72 -> 80 at FFmpeg 5.0:

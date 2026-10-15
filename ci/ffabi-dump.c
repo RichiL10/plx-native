@@ -72,6 +72,11 @@ DUMP(off_frame_width,    offsetof(AVFrame, width))
 DUMP(off_frame_height,   offsetof(AVFrame, height))
 DUMP(off_frame_format,   offsetof(AVFrame, format))
 DUMP(off_frame_pts,      offsetof(AVFrame, pts))
+/* FORK (RichiL10): the audio lanes (ff_pcm.rs, ff_enc.rs). */
+DUMP(off_frame_nb_samples,  offsetof(AVFrame, nb_samples))
+DUMP(off_frame_sample_rate, offsetof(AVFrame, sample_rate))
+DUMP(off_frame_ch_layout,   offsetof(AVFrame, ch_layout))
+DUMP(sizeof_ch_layout,      sizeof(AVChannelLayout))
 
 /* Structs ff.rs models field-by-field with #[repr(C)]. A short model is a stack smash for the
  * two it allocates (AVCodecParameters, AVSubtitle), so these sizes are load-bearing. */
