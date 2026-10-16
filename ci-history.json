@@ -1,9 +1,11 @@
-{"updated":"2026-10-15T19:41:56Z",
+{"updated":"2026-10-16T23:07:32Z",
 "ci":[
-{"id":38794974282,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"host harness tests":142,"host lint + type-checks":161,"host unit tests (default features)":406,"host unit tests (hostsim)":446,"host python/shell/C gates":164,"cross-build (armv7) + artifact assertions":396,"host checks (NOT a device gate)":3}}
+{"id":38794974282,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"host harness tests":142,"host lint + type-checks":161,"host unit tests (default features)":406,"host unit tests (hostsim)":446,"host python/shell/C gates":164,"cross-build (armv7) + artifact assertions":396,"host checks (NOT a device gate)":3}},
+{"id":38979075443,"at":"2026-10-16T23:00:51Z","sha":"0b0b22092","title":"Add German (de) as a UI language","pr":820,"conclusion":"failure","attempt":1,"jobs":{"which gates apply":6,"armv7 cross-build and artifact assertions":382,"host python/shell/C gates":180,"host lint + type-checks":192,"host unit tests (default features)":314,"host harness tests":172,"cross-build (armv7) + artifact assertions":2},"failed":["host checks (NOT a device gate)","host unit tests (hostsim)"]}
 ],
 "sim":[
-{"id":38794974308,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"macOS simulator build + launch":390,"Linux simulator build + launch":357,"macOS tests against bundled FFmpeg and ASS":388,"Windows launcher syntax":20}}
+{"id":38794974308,"at":"2026-10-15T19:34:11Z","sha":"57e28903e","title":"Dependencies: Dependabot for cargo, Actions, pip and npm; generated crate notices","pr":770,"conclusion":"success","attempt":1,"jobs":{"macOS simulator build + launch":390,"Linux simulator build + launch":357,"macOS tests against bundled FFmpeg and ASS":388,"Windows launcher syntax":20}},
+{"id":38979075383,"at":"2026-10-16T23:00:51Z","sha":"0b0b22092","title":"Add German (de) as a UI language","pr":820,"conclusion":"success","attempt":1,"jobs":{"Windows launcher syntax":19,"macOS simulator build + launch":383,"Linux simulator build + launch":354,"macOS tests against bundled FFmpeg and ASS":240}}
 ],
 "nightly":[],
 "cancelled":{},
