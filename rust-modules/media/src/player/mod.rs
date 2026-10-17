@@ -1529,6 +1529,9 @@ impl Diag {
             2 => "AC3 PLUS",
             3 => "AAC",
             4 => "DTS",
+            // FORK (RichiL10): the fork's audio lanes (`engine::audio_payload_codec`).
+            5 => "PCM",
+            6 => "OPUS",
             _ => "NONE (needAudio:false)",
         }
     }

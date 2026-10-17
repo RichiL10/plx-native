@@ -5404,6 +5404,22 @@ pub fn stream_immersive(ps: &PlaybackSession) -> bool {
     // source flag exists, so neither diagnostics nor Load may repeat that source-only claim.
     s.stream_acodec.eq_ignore_ascii_case("eac3") && s.stream_immersive
 }
+/// FORK (RichiL10): the fork's audio-lane declaration (PCM for FLAC/native PCM, OPUS) for the
+/// installed route's OUTPUT audio codec, from the carried track's facts as PMS reported them
+/// (`metadata::audio_facts`). `None` for every codec the pipeline decodes itself — and for a lane
+/// codec whose facts are unknown, which the Load refuses rather than guess.
+pub fn stream_audio_lane(ps: &PlaybackSession) -> Option<crate::player::engine::AudioLaneInfo> {
+    let carried = ps.cur_audio.as_ref()?;
+    let facts = plx_data::metadata::audio_facts(carried.sid).unwrap_or_default();
+    let channels = if carried.channels > 0 { carried.channels } else { facts.channels };
+    crate::player::engine::AudioLaneInfo::for_track(
+        &ps.stream_acodec,
+        facts.rate,
+        channels,
+        facts.bit_depth,
+        plx_base::forkknobs::get("pcm_hi").as_deref(),
+    )
+}
 /// Override the audio codec used to build the Load payload — set by a native audio-track
 /// switch to the chosen track's codec before the direct-play reload.
 pub fn set_stream_acodec(ps: &mut PlaybackSession, codec: &str) {

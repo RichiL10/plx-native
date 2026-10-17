@@ -422,6 +422,11 @@ plx_base::dynlib! {
     ) -> c_int;
     fn avsubtitle_free(sub: *mut AVSubtitle);
     fn avcodec_free_context(ctx: *mut *mut AVCodecContext);
+    // FORK (RichiL10): audio decode for the PCM lane (`ff_pcm.rs`) — the send/receive API, in
+    // libavcodec since 3.1 and the only audio decode API FFmpeg 9.0 has.
+    fn avcodec_send_packet(ctx: *mut AVCodecContext, pkt: *const AVPacket) -> c_int;
+    fn avcodec_receive_frame(ctx: *mut AVCodecContext, frame: *mut c_void) -> c_int;
+    fn avcodec_flush_buffers(ctx: *mut AVCodecContext);
     // Scratch AVCodecParameters for `sub_canvas` — library-allocated so its true size (136 on
     // this build) is never our problem, and `from_context` starts by av_freep-ing par->extradata.
     // Both PRESENT on the device's own libavcodec.so.57.89.100 (`tools/abi-probe.sh has
@@ -455,6 +460,8 @@ plx_base::dynlib! {
     // MPEG1 encode input frames + option/pixfmt helpers (venc section)
     fn av_frame_alloc() -> *mut c_void;
     fn av_frame_free(frame: *mut *mut c_void);
+    // FORK (RichiL10): the PCM lane reuses one frame per decoded packet.
+    fn av_frame_unref(frame: *mut c_void);
     fn av_frame_get_buffer(frame: *mut c_void, align: c_int) -> c_int;
     fn av_frame_make_writable(frame: *mut c_void) -> c_int;
     fn av_opt_set(obj: *mut c_void, name: *const c_char, val: *const c_char, search_flags: c_int) -> c_int;
@@ -709,7 +716,9 @@ unsafe fn audio_stream_matching(fmt: *mut AVFormatContext, want: &str) -> Option
         let cp = stream_codecpar(*streams.add(i as usize));
         if (*cp).codec_type == AVMEDIA_TYPE_AUDIO {
             let name = std::ffi::CStr::from_ptr(avcodec_get_name((*cp).codec_id)).to_string_lossy();
-            if name.eq_ignore_ascii_case(want) {
+            // FORK (RichiL10): PMS says `pcm` for every LPCM flavour FFmpeg names `pcm_s24le` etc.
+            let pcm_family = want.eq_ignore_ascii_case("pcm") && name.starts_with("pcm_");
+            if name.eq_ignore_ascii_case(want) || pcm_family {
                 return Some(i as c_int);
             }
         }
@@ -1730,6 +1739,11 @@ mod acquisition;
 mod subs;
 #[path = "ff_subside.rs"]
 pub(crate) mod subside;
+// FORK (RichiL10): the PCM audio lane (FLAC decoded in-app, native PCM converted).
+#[path = "ff_pcm.rs"]
+mod pcm;
+pub use pcm::{declare as declare_pcm, PcmSpec, PcmWidth};
+use pcm::PcmLane;
 use subs::{SubKind, SubTracks};
 #[cfg(test)]
 use subs::{decode_bitmap_cue, open_sub_decoder, sub_kind};
@@ -8688,6 +8702,29 @@ pub fn demux(
                 if dts_audio {
                     crate::player::log("ff: DTS core extraction on (DTS-HD extensions discarded)");
                 }
+                // FORK (RichiL10): FLAC and native PCM go through the PCM lane in the format the
+                // Load declared (`ff_pcm.rs`); Opus is fed as-is with its declared opusInfo.
+                let mut pcm_lane: Option<PcmLane> = None;
+                if ai >= 0 {
+                    let acp = stream_codecpar(*streams.add(ai as usize));
+                    match PcmLane::open(acp, pcm::declared()) {
+                        Ok(lane) => pcm_lane = lane,
+                        Err(why) => {
+                            crate::player::log(&format!("ff: PCM lane refused: {why}; refusing audio feed"));
+                            SHARED.demux_failed.store(true, Ordering::Release);
+                            avformat_close_input(&mut fmt);
+                            free_avio(avio);
+                            break;
+                        }
+                    }
+                    if std::ffi::CStr::from_ptr(avcodec_get_name((*acp).codec_id)).to_bytes() == b"opus" {
+                        crate::player::log(&format!(
+                            "ff: audio lane OPUS native {}ch (OpusHead {} bytes)",
+                            (*acp).ch_layout.nb_channels,
+                            (*acp).extradata_size
+                        ));
+                    }
+                }
                 if let Some((fi, ch)) = aac_adts {
                     crate::player::log(&format!(
                         "ff: AAC → ADTS reframing on (freq_idx={fi} ch={ch})"
@@ -8927,6 +8964,10 @@ pub fn demux(
                         crate::player::log(&format!("ff: seek begin {}s", seek_ns / 1_000_000_000));
                         let seek_began = std::time::Instant::now();
                         let sr = av_seek_frame(fmt, vi, ts, AVSEEK_FLAG_BACKWARD);
+                        // FORK (RichiL10): no decoder state may survive the discontinuity.
+                        if let Some(lane) = pcm_lane.as_mut() {
+                            lane.flush();
+                        }
                         crate::player::log(&format!(
                             "ff: seek {}s rv={sr} ms={}",
                             seek_ns / 1_000_000_000,
@@ -9085,6 +9126,17 @@ pub fn demux(
                                 aqa_p, core.as_ptr(), core.len() as c_int, pts, 1, 2,
                                 || state.drain_wire(),
                             )
+                        } else if let Some(lane) = pcm_lane.as_mut() {
+                            // FORK (RichiL10): decoded/converted PCM, one buffer per packet.
+                            let pcm = lane.convert(pkt);
+                            if pcm.is_empty() {
+                                0
+                            } else {
+                                crate::aq::aq_push_with_drain(
+                                    aqa_p, pcm.as_ptr(), pcm.len() as c_int, pts, 1, 2,
+                                    || state.drain_wire(),
+                                )
+                            }
                         } else {
                             crate::aq::aq_push_with_drain(
                                 aqa_p,

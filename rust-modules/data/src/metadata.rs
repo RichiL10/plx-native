@@ -2427,12 +2427,48 @@ pub struct Streams {
     pub dovi: Dovi,
 }
 
+/// FORK (RichiL10): what the fork's PCM lane must know about an audio stream to declare it in the
+/// Load payload before the demuxer opens the file: PMS `samplingRate`, `channels`, `bitDepth`
+/// (0 = not said). Kept OUT of [`Stream`] on purpose: that struct is a recorded wire value whose
+/// recordings must re-serialize byte for byte, and these facts matter to one Load decision only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioFacts {
+    pub rate: i64,
+    pub channels: i64,
+    pub bit_depth: i64,
+}
+
+/// Every audio stream this process has converted metadata for, by PMS stream id. Bounded: it is
+/// cleared when it grows past a few thousand entries, which costs at most a re-fetch's worth of
+/// facts for a track that is not playing.
+static AUDIO_FACTS: std::sync::Mutex<std::collections::BTreeMap<i64, AudioFacts>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn record_audio_facts(id: i64, facts: AudioFacts) {
+    if id <= 0 {
+        return;
+    }
+    let mut map = AUDIO_FACTS.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 4096 && !map.contains_key(&id) {
+        map.clear();
+    }
+    map.insert(id, facts);
+}
+
+/// The facts recorded for PMS audio stream `id`, if its metadata was ever converted.
+pub fn audio_facts(id: i64) -> Option<AudioFacts> {
+    AUDIO_FACTS.lock().unwrap_or_else(|e| e.into_inner()).get(&id).copied()
+}
+
 fn convert_streams(streams: &[plx_plex::plex::Stream]) -> Streams {
     let (mut audio, mut subs, mut fps) = (Vec::new(), Vec::new(), 0.0);
     let mut hdr = false;
     let mut dovi = Dovi::default();
     let mut video: Option<Stream> = None;
     for s in streams {
+        if s.stream_type == 2 {
+            record_audio_facts(s.id, AudioFacts { rate: s.sampling_rate, channels: s.channels, bit_depth: s.bit_depth });
+        }
         let st = Stream {
             id: s.id,
             index: s.index,
