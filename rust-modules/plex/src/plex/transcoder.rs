@@ -35,6 +35,12 @@ pub fn is_dp_audio_track(codec: &str, channels: i64) -> bool {
     plx_platform::devcaps::caps().audio_supports(codec, channels)
 }
 
+/// FORK (RichiL10): [`is_dp_audio_track`] with the track's sample rate (Hz, 0 = not known): the
+/// in-app AC3 encode lane takes 48 kHz only (`devcaps::ENC_LANE_RATE`).
+pub fn is_dp_audio_track_at(codec: &str, channels: i64, rate: i64) -> bool {
+    plx_platform::devcaps::caps().audio_supports_at(codec, channels, rate)
+}
+
 /// Subtitle codecs Original client-renders (`ff.rs` / the track menu). This is the
 /// `subtitleCodec=` list on the direct-play profile **and** the gate on MDE's
 /// `subtitleStreamID`: a selected embedded track whose codec is here is named on `/decision`,
@@ -209,6 +215,11 @@ pub fn direct_play_video_codecs(caps: &plx_platform::devcaps::Caps) -> Vec<&'sta
 /// The Load payload cannot drift whatever PMS chooses: `route.rs` reads the OUTPUT codecs off
 /// the /decision response (`decision_codecs`) and describes those, not the profile's wish.
 fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeDelivery) -> String {
+    profile_for_delivery_with(caps, delivery, plx_platform::devcaps::encode_lane_on())
+}
+
+/// [`profile_for_delivery`] with the fork's `encode` knob passed in (pure, for tests).
+fn profile_for_delivery_with(caps: &plx_platform::devcaps::Caps, delivery: TranscodeDelivery, encode: bool) -> String {
     let dp_video = direct_play_video_codecs(caps).join(",");
     // The table-gated copy codecs, in list order. Each one is advertised only when the table
     // carries ITS row, and each brings the row's own bound (see `row_limits`).
@@ -269,7 +280,9 @@ fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeD
             caps.vp9_bit_depth
         ));
     }
-    let dp_audio = &caps.audio;
+    // FORK (RichiL10): plus the codecs only the in-app AC3 encode lane decodes (TrueHD, MLP).
+    let enc_only = caps.enc_lane_profile_codecs(encode);
+    let dp_audio = &std::iter::once(caps.audio.as_str()).chain(enc_only.iter().copied()).collect::<Vec<_>>().join(",");
     // ac3 first — the preferred ENCODE target — then the rest of the caps subset as copy lanes.
     let target_audio = ["ac3", "eac3", "aac", "dts"]
         .into_iter()
@@ -281,11 +294,19 @@ fn profile_for_delivery(caps: &plx_platform::devcaps::Caps, delivery: TranscodeD
     let audio_limits = caps.audio_channels.iter()
         .filter(|(codec, _)| caps.audio_has(codec))
         // FORK (RichiL10): the stated bound, which for DTS admits the 6.1/7.1 tracks whose core
-        // the demuxer feeds (`Caps::profile_channel_limit`).
-        .map(|(codec, raw)| (codec, caps.profile_channel_limit(codec).unwrap_or(*raw)))
+        // the demuxer feeds, and for FLAC/PCM the 8 channels the encode lane converts
+        // (`Caps::profile_channel_limit_with`).
+        .map(|(codec, raw)| (codec.as_str(), caps.profile_channel_limit_with(codec, encode).unwrap_or(*raw)))
+        .chain(enc_only.iter().map(|c| (*c, caps.profile_channel_limit_with(c, encode).unwrap_or(8))))
         .map(|(codec, channels)| format!(
             "+add-limitation(scope=videoAudioCodec&scopeName={codec}&type=upperBound&name=audio.channels&value={channels}&replace=true)"
         ))
+        // FORK (RichiL10): TrueHD/MLP always go through the encode lane, which has no resampler,
+        // so PMS converts any of them above 48 kHz itself.
+        .chain(enc_only.iter().map(|codec| format!(
+            "+add-limitation(scope=videoAudioCodec&scopeName={codec}&type=upperBound&name=audio.samplingRate&value={}&replace=true)",
+            plx_platform::devcaps::ENC_LANE_RATE
+        )))
         .collect::<String>();
     let target = match delivery {
         TranscodeDelivery::ProgressiveMkv => format!(
@@ -1294,6 +1315,43 @@ mod tests {
         assert!(!p.contains("add-limitation"));
         assert!(!p.contains("transcode-target"));
         assert!(!p.contains("truehd"));
+    }
+
+    /// FORK (RichiL10): with the in-app AC3 encode lane on, MDE must answer direct play for the
+    /// tracks the app converts itself: TrueHD/MLP join the direct-play list and FLAC/PCM are
+    /// stated up to 8 channels. Off, the profile is exactly what it was.
+    #[test]
+    fn the_encode_lane_admits_truehd_and_8ch_flac_in_the_profile() {
+        let mut caps = Caps::assumed();
+        caps.audio = "aac,ac3,eac3,dts,flac,pcm,opus".into();
+        for (c, n) in [("ac3", 6), ("eac3", 8), ("dts", 6), ("flac", 2), ("pcm", 2), ("opus", 6)] {
+            caps.audio_channels.insert(c.into(), n);
+        }
+        let on = super::profile_for_delivery_with(&caps, TranscodeDelivery::ProgressiveMkv, true);
+        let dp = on.split("add-transcode-target").next().unwrap();
+        assert_eq!(list_of(dp, "audioCodec="), ["aac", "ac3", "eac3", "dts", "flac", "pcm", "opus", "truehd", "mlp"]);
+        for codec in ["flac", "pcm", "truehd", "mlp"] {
+            assert!(
+                on.contains(&format!("scopeName={codec}&type=upperBound&name=audio.channels&value=8&replace=true")),
+                "{codec}: {on}"
+            );
+        }
+        assert!(on.contains("scopeName=opus&type=upperBound&name=audio.channels&value=6&replace=true"));
+        assert!(on.contains("scopeName=truehd&type=upperBound&name=audio.samplingRate&value=48000&replace=true"));
+        assert!(on.contains("scopeName=mlp&type=upperBound&name=audio.samplingRate&value=48000&replace=true"));
+        // the PCM lane takes any rate, so FLAC/PCM carry no rate bound
+        assert!(!on.contains("scopeName=flac&type=upperBound&name=audio.samplingRate"));
+        // the server only ever encodes INTO what the television decodes
+        let target = list_of(target_of(&on), "audioCodec=");
+        assert!(!target.iter().any(|c| c == "truehd" || c == "mlp"), "{target:?}");
+
+        let off = super::profile_for_delivery_with(&caps, TranscodeDelivery::ProgressiveMkv, false);
+        assert!(!off.contains("truehd") && !off.contains("mlp") && !off.contains("samplingRate"), "{off}");
+        assert!(off.contains("scopeName=flac&type=upperBound&name=audio.channels&value=2&replace=true"));
+        assert!(off.contains("scopeName=pcm&type=upperBound&name=audio.channels&value=2&replace=true"));
+        // no measured AC3 5.1 sink, no lane, whatever the knob says
+        let plain = super::profile_for_delivery_with(&Caps::assumed(), TranscodeDelivery::ProgressiveMkv, true);
+        assert_eq!(plain, super::profile_for_delivery_with(&Caps::assumed(), TranscodeDelivery::ProgressiveMkv, false));
     }
 
     /// The other side of issue #22's fallback-chain rule: on a SoC whose table has no HEVC row,

@@ -170,6 +170,12 @@ fi
 #              FFmpeg here never touches a video frame.
 #   encoder/   mpeg1video + mpegts are the DEV capture stream only, dropped by RELEASE=1 along
 #   muxer      with swscale, which nothing else uses.
+#   FORK (RichiL10): the fork's audio lanes, in release and dev builds alike. `flac` feeds the
+#              PCM lane (ff_pcm.rs). `truehd`/`mlp` (+ the `mlp` parser) and `ac3_fixed` are the
+#              AC3 encode lane (ff_enc.rs): a track the TV cannot decode is decoded here, folded
+#              to 5.1 and re-encoded to AC3 640 kbps in INTEGER arithmetic (the build is
+#              soft-float ARM, so the float `ac3` encoder is not wanted). No resampler:
+#              `--disable-swresample` stays, and the lane takes 48 kHz sources only.
 #
 # `--disable-autodetect` is NOT redundant beside `--disable-everything`, which governs the
 # component registry and says nothing about EXTERNAL libraries. Without it configure goes looking
@@ -217,9 +223,10 @@ set -- "$@" \
   --disable-autodetect \
   --enable-zlib \
   --enable-demuxer=matroska,mov,mpegts,h264,hevc \
-  --enable-parser=h264,hevc,aac,ac3,dvdsub,dvbsub \
+  --enable-parser=h264,hevc,aac,ac3,dvdsub,dvbsub,mlp \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata \
-  --enable-decoder=pgssub,dvdsub,dvbsub,ass,srt,subrip,text,mov_text,webvtt,flac \
+  --enable-decoder=pgssub,dvdsub,dvbsub,ass,srt,subrip,text,mov_text,webvtt,flac,truehd,mlp \
+  --enable-encoder=ac3_fixed \
   --enable-protocol=file
 
 if [ "${RELEASE:-}" = "1" ]; then

@@ -465,6 +465,9 @@ plx_base::dynlib! {
     fn av_frame_get_buffer(frame: *mut c_void, align: c_int) -> c_int;
     fn av_frame_make_writable(frame: *mut c_void) -> c_int;
     fn av_opt_set(obj: *mut c_void, name: *const c_char, val: *const c_char, search_flags: c_int) -> c_int;
+    // FORK (RichiL10): channel roles and the 5.1(side) layout for the AC3 encode lane (`ff_enc.rs`).
+    fn av_channel_layout_channel_from_index(layout: *const AVChannelLayout, idx: c_uint) -> c_int;
+    fn av_channel_layout_from_string(layout: *mut AVChannelLayout, s: *const c_char) -> c_int;
     fn av_get_pix_fmt(name: *const c_char) -> c_int;
     // Container tags. Borrowed, never freed: the entry belongs to the dictionary, which belongs to
     // the AVStream, which `avformat_close_input` frees — so every read must copy before the close.
@@ -1744,6 +1747,12 @@ pub(crate) mod subside;
 mod pcm;
 pub use pcm::{declare as declare_pcm, PcmSpec, PcmWidth};
 use pcm::PcmLane;
+// FORK (RichiL10): the AC3 encode lane (FLAC/PCM above the PCM lane, TrueHD/MLP: decoded,
+// folded to 5.1 and encoded to AC3 640 kbps in-app).
+#[path = "ff_enc.rs"]
+mod enc;
+pub use enc::{declare as declare_enc, EncSpec};
+use enc::EncLane;
 use subs::{SubKind, SubTracks};
 #[cfg(test)]
 use subs::{decode_bitmap_cue, open_sub_decoder, sub_kind};
@@ -8705,17 +8714,22 @@ pub fn demux(
                 // FORK (RichiL10): FLAC and native PCM go through the PCM lane in the format the
                 // Load declared (`ff_pcm.rs`); Opus is fed as-is with its declared opusInfo.
                 let mut pcm_lane: Option<PcmLane> = None;
+                // FORK (RichiL10): ...and the tracks the Load declared as encode-lane AC3 go
+                // through the AC3 encode lane instead (`ff_enc.rs`).
+                let mut enc_lane: Option<EncLane> = None;
                 if ai >= 0 {
                     let acp = stream_codecpar(*streams.add(ai as usize));
-                    match PcmLane::open(acp, pcm::declared()) {
-                        Ok(lane) => pcm_lane = lane,
-                        Err(why) => {
-                            crate::player::log(&format!("ff: PCM lane refused: {why}; refusing audio feed"));
-                            SHARED.demux_failed.store(true, Ordering::Release);
-                            avformat_close_input(&mut fmt);
-                            free_avio(avio);
-                            break;
-                        }
+                    let opened = match enc::declared() {
+                        Some(spec) => EncLane::open(acp, spec).map(|lane| enc_lane = Some(lane)),
+                        None => PcmLane::open(acp, pcm::declared()).map(|lane| pcm_lane = lane),
+                    };
+                    if let Err(why) = opened {
+                        let which = if enc::declared().is_some() { "encode" } else { "PCM" };
+                        crate::player::log(&format!("ff: {which} lane refused: {why}; refusing audio feed"));
+                        SHARED.demux_failed.store(true, Ordering::Release);
+                        avformat_close_input(&mut fmt);
+                        free_avio(avio);
+                        break;
                     }
                     if std::ffi::CStr::from_ptr(avcodec_get_name((*acp).codec_id)).to_bytes() == b"opus" {
                         crate::player::log(&format!(
@@ -8968,6 +8982,9 @@ pub fn demux(
                         if let Some(lane) = pcm_lane.as_mut() {
                             lane.flush();
                         }
+                        if let Some(lane) = enc_lane.as_mut() {
+                            lane.flush();
+                        }
                         crate::player::log(&format!(
                             "ff: seek {}s rv={sr} ms={}",
                             seek_ns / 1_000_000_000,
@@ -9126,6 +9143,19 @@ pub fn demux(
                                 aqa_p, core.as_ptr(), core.len() as c_int, pts, 1, 2,
                                 || state.drain_wire(),
                             )
+                        } else if let Some(lane) = enc_lane.as_mut() {
+                            // FORK (RichiL10): zero or more AC3 frames, each with its own pts.
+                            let mut pushed = 0;
+                            for (at, ac3) in lane.convert(pkt, pts_ns_opt(pkt, ast)) {
+                                pushed = crate::aq::aq_push_with_drain(
+                                    aqa_p, ac3.as_ptr(), ac3.len() as c_int, *at, 1, 2,
+                                    || state.drain_wire(),
+                                );
+                                if pushed != 0 {
+                                    break;
+                                }
+                            }
+                            pushed
                         } else if let Some(lane) = pcm_lane.as_mut() {
                             // FORK (RichiL10): decoded/converted PCM, one buffer per packet.
                             let pcm = lane.convert(pkt);

@@ -6654,6 +6654,15 @@ pub fn audio_track_direct_plays(ps: &PlaybackSession, codec: &str, channels: i64
     audio_direct_plays(ps.direct_play_mode, codec, channels)
 }
 
+/// FORK (RichiL10): [`audio_track_direct_plays`] for a carried track, plus the in-app AC3 encode
+/// lane's 48 kHz rule (`plan::enc_lane_rate_ok_for`, read from the track's PMS facts). Without it a
+/// mid-playback pick of a 96 kHz TrueHD or multichannel FLAC track would switch in place to a Load
+/// the encode lane then refuses, instead of letting the server convert it.
+fn carried_audio_direct_plays(ps: &PlaybackSession, a: &CarriedAudio) -> bool {
+    audio_track_direct_plays(ps, &a.codec, a.channels)
+        && super::plan::enc_lane_rate_ok_for(a.sid, &a.codec, a.channels)
+}
+
 /// **Would the server convert this track's audio if it played?** The track menu's "converted by
 /// your server" mark: a track the TV cannot decode (`audio_direct_plays`, the same capability
 /// answer the planner and the profile use) plays through the server's remux or re-encode with its
@@ -8913,7 +8922,13 @@ fn remux_output_acodec(
     enhanced: bool, carried: Option<&CarriedAudio>, src_acodec: &str,
 ) -> String {
     let carried = carried.filter(|a| !a.codec.is_empty());
-    if enhanced || carried.is_some_and(|a| !plx_plex::plex::is_dp_audio_track(&a.codec, a.channels)) {
+    // FORK (RichiL10): TrueHD/MLP direct-play through the in-app encode lane, but the transcode
+    // target never lists them, so a remux converts them to its first target (ac3).
+    let server_converts = |a: &CarriedAudio| {
+        !plx_plex::plex::is_dp_audio_track(&a.codec, a.channels)
+            || matches!(plx_platform::devcaps::dp_audio_key(&a.codec), "truehd" | "mlp")
+    };
+    if enhanced || carried.is_some_and(server_converts) {
         "ac3".to_owned()
     } else {
         carried.map_or_else(|| src_acodec.to_owned(), |a| a.codec.clone())
@@ -9622,7 +9637,7 @@ pub enum LegacyAction {
 
 pub fn legacy_action(ps: &PlaybackSession) -> LegacyAction {
     match (live_family(ps), ps.cur_audio.as_ref()) {
-        (RouteFamily::Direct, Some(a)) if audio_track_direct_plays(ps, &a.codec, a.channels) => {
+        (RouteFamily::Direct, Some(a)) if carried_audio_direct_plays(ps, a) => {
             LegacyAction::Native {
                 ordinal: a.ordinal,
                 codec: a.codec.clone(),
@@ -10332,7 +10347,7 @@ pub fn commit_audio_selection(ps: &mut PlaybackSession, audio: CarriedAudio) -> 
 
 /// The route half of [`commit_audio_selection`]: which way the pick reloads, and what it displaces.
 fn commit_audio_route(ps: &mut PlaybackSession, audio: CarriedAudio) -> bool {
-    if forced_direct_play(ps) && !audio_track_direct_plays(ps, &audio.codec, audio.channels) {
+    if forced_direct_play(ps) && !carried_audio_direct_plays(ps, &audio) {
         ps.play_verdict = Some(PlayVerdict::Forced(ForcedFailure::AudioNeedsConversion));
         return false;
     }
@@ -10355,7 +10370,7 @@ fn commit_audio_route(ps: &mut PlaybackSession, audio: CarriedAudio) -> bool {
     // A standing Burn is wire-shaped `Other`, but it is an Original-family route: the pick must
     // retarget the candidate the release returns to, exactly as on a remux.
     let family = enhancement_family(ps);
-    let direct_plays = audio_track_direct_plays(ps, &audio.codec, audio.channels);
+    let direct_plays = carried_audio_direct_plays(ps, &audio);
     match family {
         // The recovery declaration captures one exact source/audio pairing. Once the user changes
         // that pairing while HLS is live, do not later resurrect the old track behind their back.

@@ -2155,9 +2155,10 @@ $(FFMPEG_HOST_STAGED): pkg/%.dylib: $(FFMPEG_HOST_INC)/libavformat/avformat.h ci
 # `#[ignore]`d in the plain suite; the first is the zlib-compressed PGS track that no configure
 # flag change may silently drop again (`ff_image_subtitle_tests.rs`). macOS only, like the staging.
 # The ASS reader tests also need staged libass to compare caption pixels after packet ingestion.
+# FORK (RichiL10): plus the AC3 encode lane's round trip through the bundled ac3_fixed (ff_enc.rs).
 check-ffmpeg: $(FFMPEG_HOST_STAGED) $(LIBASS_HOST_STAGED)
 	cd rust-modules && CARGO_INCREMENTAL=0 PLX_FFMPEG_DIR=$(CURDIR)/pkg PATH="$$HOME/.cargo/bin:$$PATH" \
-	  cargo +$(RUST_TOOLCHAIN) test --lib -p plx_media -- ff::image_subtitle_tests ff::subtitle_charset_tests ff::subside::tests::side_reader_draws_a_shifted_cue_from_a_generated_mkv --ignored
+	  cargo +$(RUST_TOOLCHAIN) test --lib -p plx_media -- ff::image_subtitle_tests ff::subtitle_charset_tests ff::subside::tests::side_reader_draws_a_shifted_cue_from_a_generated_mkv ff::enc::tests::a_71_sine_round_trips_to_640_kbps_ac3 --ignored
 
 # The same ABI gate the cross build runs, at the other pointer width. ci/ffabi-assert.c `#if`s on
 # `__SIZEOF_POINTER__` and carries both tables, so this compile is what holds ff.rs's 64-bit
