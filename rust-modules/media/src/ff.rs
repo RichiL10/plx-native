@@ -7995,7 +7995,10 @@ fn open_input_failure_note(r: c_int, lane_aborted: bool) -> String {
 ///
 /// So from the first video push that WOULD PARK at the base cap while no audio AU has been pushed in
 /// this open or seek, the video lane's cap is its base cap PLUS this much: **10 MiB + 24 MiB =
-/// 34 MiB (~35.6 MB) in total.** The grant is lazy on purpose: an ordinary file (video a few
+/// 34 MiB (~35.6 MB) in total** upstream. FORK (RichiL10): the fork's base cap is 96 MiB
+/// (`player::engine::AQ_VIDEO_BYTES`), which alone holds the reported film's 11 s pre-audio stretch
+/// at up to ~73 Mbit/s, so the grant only matters for a UHD remux whose audio starts late, and the
+/// lane can reach 120 MiB for that stretch. The grant is lazy on purpose: an ordinary file (video a few
 /// packets ahead of the first audio, B-frames, a muxer that leads with video) never fills the base
 /// cap before its first audio packet, so it never sees the grant and keeps the memory behaviour it
 /// always had; on a 60-100 Mbit/s UHD stream an eager grant would have cost 18-30 MiB of extra
@@ -8288,16 +8291,20 @@ mod pre_audio_headroom_tests {
     fn the_bound_holds_the_measured_cases_and_not_everything() {
         let base = crate::player::aq_caps().0;
         let cap = base + PRE_AUDIO_VIDEO_HEADROOM as i64;
-        assert_eq!(cap, 34 * 1024 * 1024);
+        // FORK (RichiL10): the fork's 96 MiB base (upstream 10 MiB, so 34 MiB in total there).
+        assert_eq!(cap, (96 + 24) * 1024 * 1024);
         let bytes = |mbit: f64, secs: f64| (mbit * 1e6 / 8.0 * secs) as i64;
-        // the reported film: 11.008 s of ~9.5 Mbit/s video
+        // the reported film: 11.008 s of ~9.5 Mbit/s video. Upstream's 10 MiB cap could not hold
+        // it; the fork's base cap does, so the grant is not even reached for it.
         let film = bytes(9.495_770, 11.008);
-        assert!(film > base, "the plain cap alone cannot hold it");
-        assert!(film < cap);
+        assert!(film < base, "the fork's base cap holds the reported film's pre-audio stretch");
+        assert!(film > 10 * 1024 * 1024, "upstream's 10 MiB cap could not");
         // the fixture: 12 Mbit/s, same delay, and then the lead-in's worth of video as well
         let lead_s = (crate::player::engine::AUDIO_LEAD_IN_NS + LEAD_IN_MARGIN_NS) as f64 / 1e9;
         assert!(bytes(12.0, 11.008 + lead_s) < cap, "headroom spans the pre-audio stretch AND the lead-in");
-        assert!(bytes(35.0, 11.008) > cap, "a bound, not a promise");
+        // a UHD remux the base cap alone cannot carry through the same delay, which the grant can
+        assert!(bytes(80.0, 11.008) > base && bytes(80.0, 11.008) < cap);
+        assert!(bytes(100.0, 11.008) > cap, "a bound, not a promise");
     }
 }
 
