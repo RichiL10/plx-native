@@ -1436,6 +1436,129 @@ fn picking_a_playable_track_again_clears_audio_converted() {
     cleanup(&mut ps);
 }
 
+// FORK (RichiL10): the fork's plain remux, live only because the carried track (A4) cannot
+// direct-play: the candidate is the direct Part with its audio marked converted.
+fn install_fork_remux(ps: &mut PlaybackSession, live: &Live) {
+    let mut cand = candidate(true, a4(), None);
+    cand.audio_converted = true;
+    install(ps, live, Delivery::Remux(NONE), a4(), Some(cand), 0);
+    assert!(is_transcoding(ps) && ps.cur_contract.remux && ps.cur_contract.audio == NONE);
+}
+
+/// FORK (RichiL10): a direct-playable pick on the fork's plain remux goes back to the file with
+/// the picked track: one `RecoverOriginal(EnhancementReleased)` claim (primary `ReleaseToDirect`)
+/// owing the pick its reload (fallback Legacy), and no new remux asked of PMS.
+#[test]
+fn fork_a_direct_playable_pick_on_the_plain_remux_releases_to_the_file() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    commit_audio_selection(&mut ps, a1());
+    assert!(ps.auto_original.as_ref().is_some_and(|c| c.feeds_part()));
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    let (action, tail) = claim(&mut ps);
+    assert!(action.displaced_pick, "a refused release still owes the pick its reload");
+    // `execute_recover_original_claim`'s dispatch: primary `ReleaseToDirect`, this fallback
+    assert_eq!(ClaimFallback::owed(action.displaced_pick), ClaimFallback::Legacy);
+    assert_eq!(tail, ClaimTail::Original(AutoOriginalReload::Direct));
+    assert_eq!(ps.cur_audio, Some(a1()));
+    assert_eq!(ps.stream_acodec, "ac3");
+    assert_eq!(desired_audio_idx(), 1, "the direct play feeds the picked track");
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "no remux was asked for: {requests:?}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10): the release refused at plan time (here the candidate is gone by the claim)
+/// falls back to the pick's own server reload: a plain remux naming the new track.
+#[test]
+fn fork_a_refused_release_still_switches_the_track_on_the_server() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    commit_audio_selection(&mut ps, a1());
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    ps.auto_original = None;
+    let (action, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Retranscode, "the Legacy fallback rebuilt the stream");
+    settle(&mut ps, &action, tail);
+    assert_eq!(ps.cur_audio, Some(a1()));
+    let requests = live.finish();
+    let d = decisions(&requests);
+    let last = d.last().expect("the fallback asked for the pick's remux");
+    assert_eq!(query_param(last, "audioStreamID"), Some("11"), "{last}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10): another track the TV cannot decode keeps the plain Retranscode remux.
+#[test]
+fn fork_a_non_playable_pick_on_the_plain_remux_stays_a_remux() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    let other = track(16, 6, "truehd", 8, true, false);
+    commit_audio_selection(&mut ps, other.clone());
+    assert!(pending_user_route_intent(UserRouteIntent::Retranscode));
+    let (action, tail) = claim(&mut ps);
+    assert!(!action.displaced_pick);
+    assert_eq!(tail, ClaimTail::Retranscode);
+    settle(&mut ps, &action, tail);
+    assert_eq!(ps.cur_contract, enhanced_remux_contract(NONE, false));
+    assert_eq!(ps.cur_audio, Some(other));
+    let requests = live.finish();
+    let last = *decisions(&requests).last().expect("a decision was made");
+    assert_eq!(query_param(last, "audioStreamID"), Some("16"), "{last}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10): a remux carrying an applied enhancement keeps upstream's behaviour: a capable
+/// pick with the preference on rebuilds the enhanced remux, it is never released by the fork.
+#[test]
+fn fork_an_enhanced_remux_is_not_released_by_a_pick() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    crate::player::restore_audio_enhancements(PREF);
+    install(&mut ps, &live, Delivery::Remux(PREF), a1(), Some(candidate(true, a1(), None)), 0);
+    commit_audio_selection(&mut ps, a3());
+    assert!(pending_user_route_intent(UserRouteIntent::Retranscode));
+    assert!(!pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    let (_, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Retranscode);
+    live.finish();
+    cleanup(&mut ps);
+}
+
+// ---- FORK (RichiL10): pacchetto 7 regressions, modelled on "Le due torri" ----------------------
+// DV P7 (bl_compat 6), HEVC 3840x2160 at about 66 Mbit/s, ita DTS core 5.1, eng FLAC 7.1, PGS ita/eng.
+// The host caps are `Caps::assumed()` (aac, ac3, eac3), so the track the TV decodes is an AC3 here
+// and the track only the server converts is the TrueHD of `a4`; the route rules do not look at
+// which codec stands where.
+
+/// Defect (a) of the TV run: picking back to a track the TV decodes left the server's remux
+/// running. The pick now releases the fork's remux back to the file (a fresh direct-play session,
+/// the remux retired by upstream's release once frames confirm), with no new remux asked for.
+#[test]
+fn fork_le_due_torri_picking_back_to_a_decodable_track_releases_the_remux() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    commit_audio_selection(&mut ps, a1());
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    let (_, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Original(AutoOriginalReload::Direct));
+    assert!(!is_transcoding(&ps), "back to the file");
+    let fresh = active_encoder();
+    assert_ne!(fresh, "enh-remux-1", "the direct play does not own the remux's session");
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "no remux was asked for: {requests:?}");
+    cleanup(&mut ps);
+}
+
 // ---- subtitle picks ------------------------------------------------------------------------
 
 #[test]
