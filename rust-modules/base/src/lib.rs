@@ -26,6 +26,7 @@ pub mod surface; // what we are actually drawing into: drawable vs the 1920x1080
 pub mod tile; // `Tile`: the shelf-tile trait the data layer implements and `ui` draws through
 pub mod devtrig; // the /tmp trigger PRIMITIVES (`flag`, `read`, `latched_flag!`, `no_wan`...)
 pub mod diag; // the frame instruments (`heartbeat`, `spans`) and the zlib helper
+pub mod forkknobs; // FORK (RichiL10): playback knobs read from /media/developer/plxnative-fork.conf
 #[cfg(any(test, feature = "test-support"))]
 pub mod testlock; // one lock for every test that touches a process-global
 #[cfg(any(test, feature = "test-support"))]
