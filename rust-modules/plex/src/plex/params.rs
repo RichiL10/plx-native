@@ -214,6 +214,24 @@ pub struct TranscodeSpec<'a> {
     pub client_subtitles: bool,
     /// Restart at this exact content boundary, or omit `offset` for a fresh start.
     pub offset: TranscodeOffset,
+    /// FORK (RichiL10): what the selected audio track needs, which decides the profile's
+    /// transcode TARGET audio list (`transcoder::target_audio`).
+    pub audio_target: AudioTarget,
+}
+
+/// FORK (RichiL10): the selected audio track, as the transcode target's audio list must treat it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioTarget {
+    /// Nobody said (the server-default track, or one whose facts were never read): the
+    /// established copy-lane list, ordered by the TV's sound output.
+    #[default]
+    Unknown,
+    /// The TV cannot decode the track, so the server must ENCODE it: the list names only the
+    /// codec(s) that should leave the server for this TV's sound output.
+    Encode,
+    /// A track the fork feeds through its own lane (`flac`, `pcm`, `opus`) that the server
+    /// should COPY into the remux; named first so the copy is chosen.
+    CopyLane(&'static str),
 }
 
 /// A bound a playback must come in under, in the units PMS's own params use: `maxVideoBitrate` is

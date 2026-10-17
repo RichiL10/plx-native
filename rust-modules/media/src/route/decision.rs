@@ -5389,12 +5389,46 @@ pub fn stream_dv_decision(ps: &PlaybackSession) -> plx_data::metadata::DvDecisio
     ps.stream_dv_decision
 }
 
-/// Server output (HLS encode, progressive encode or container remux) carries no client-frozen
-/// source declaration. Centralizing the paired reset prevents a future route mutation from
-/// clearing the raw metadata while leaving a stale `Declare` behind for Load.
+/// Clear source Dolby Vision only when the server changed the video elementary stream.  A
+/// progressive remux whose video decision is `copy` carries the source HEVC bitstream unchanged,
+/// so it must retain the frozen declaration that direct play would have used.
 fn clear_output_dv(session: &mut PlaybackSession) {
+    // FORK (RichiL10): PMS may omit the Matroska DOVI configuration record while retaining the
+    // HEVC RPU NALs.  The frozen source decision is therefore the only truthful Load declaration.
+    if plx_base::forkknobs::is("remux_dv", "on", "on")
+        && session.cur_contract.remux
+        && session.stream_vcodec.eq_ignore_ascii_case("hevc")
+        && session.stream_dv_decision.presentation.declared().is_some()
+    {
+        crate::player::log(&format!(
+            "route: remux keeps Dolby Vision (P{}{}, video copy)",
+            session.stream_dovi.profile,
+            if session.stream_dovi.converts_to_p81() { "->8.1" } else { "" },
+        ));
+        return;
+    }
     session.stream_dovi = plx_data::metadata::Dovi::NONE;
     session.stream_dv_decision = plx_data::metadata::DvDecision::NONE;
+}
+
+/// Thread-safe frozen Dolby Vision source metadata for the current physical route.  The demuxer
+/// uses this only when a PMS remux lost its container DOVI record.
+pub fn frozen_route_dovi() -> plx_data::metadata::Dovi {
+    PLAYER_CONTROL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied_projection
+        .as_ref()
+        .map_or(plx_data::metadata::Dovi::NONE, |p| p.stream_dovi)
+}
+
+pub fn frozen_route_declares_dv() -> bool {
+    PLAYER_CONTROL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .applied_projection
+        .as_ref()
+        .is_some_and(|p| p.stream_dv_decision.presentation.declared().is_some())
 }
 /// Is the audio being fed a Dolby Atmos stream? — the Load payload's `contents.immersive` node.
 /// See [`PlaybackSession::stream_immersive`].
@@ -8777,7 +8811,25 @@ fn re_encode_contract(
 /// contract before it rebuilds, a fixed rung fails `enhancement_quality`, and a refused remux is
 /// rejected with the current stream retained rather than retried.
 fn plain_rebuild_is_remux(ps: &PlaybackSession) -> bool {
-    original_remux_shape(ps) && (ps.cur_sub_sid == 0 || side_subs_allowed(ps))
+    (original_remux_shape(ps) || fork_copy_stays_copy(ps))
+        && (ps.cur_sub_sid == 0 || side_subs_allowed(ps))
+}
+
+/// FORK (RichiL10): **a route that copies the source video keeps copying it.** Direct play or a
+/// remux, Original quality (no ceiling), progressive MKV, a source the TV decodes: a rebuild of it
+/// (an audio pick the TV cannot decode, a seek on the remux) asks PMS for a remux with the video
+/// copied and only the audio converted, whether or not Auto captured an Original candidate.
+/// Converting the video because the audio changed is the one thing this fork never does. A
+/// fixed-quality rung, HLS, a relay (never direct or remux) and an AV1/VP9 source are untouched.
+fn fork_copy_stays_copy(ps: &PlaybackSession) -> bool {
+    enhancement_quality()
+        && (!is_transcoding(ps) || ps.cur_contract.remux)
+        && ps.cur_source_decodable
+        && ps.cur_contract.ceiling.is_none()
+        && cur_delivery(ps) == plx_plex::plex::TranscodeDelivery::ProgressiveMkv
+        && !is_no_video_copy(ps)
+        // A Profile 5 copy is only correct with its declaration (`remux_dv`).
+        && (plx_base::forkknobs::is("remux_dv", "on", "on") || !ps.stream_dovi.base_layer_unusable())
 }
 
 /// **Is the live session the Original remux's SHAPE**, whatever subtitle is on screen: a standing
@@ -8890,6 +8942,8 @@ pub(super) struct AppliedRetranscode {
     acodec: String,
     contract: plx_plex::plex::EncodeContract,
     enhancement: EnhancementOutcome,
+    /// FORK (RichiL10): the server copies the video (see [`PreparedEncode::video_copied`]).
+    pub(super) video_copied: bool,
     /// Returned by `replace_active_encoder_for`/`replace_active_hls_for` at the moment this
     /// worker actually committed the route. `take_ready_flight` re-checks it against
     /// the CURRENT route before applying: the worker's own ticket check ran before this commit,
@@ -8979,6 +9033,8 @@ pub(super) struct PreparedEncode {
     acodec: String,
     contract: plx_plex::plex::EncodeContract,
     enhancement: EnhancementOutcome,
+    /// FORK (RichiL10): the server's `/decision` copies the video stream (`decision=copy`).
+    video_copied: bool,
 }
 
 /// One `/decision` attempt, gated on `inputs.expected` throughout — the network body of a
@@ -9038,6 +9094,7 @@ pub(super) fn request_retranscode(
         acodec: output_codecs.1,
         contract,
         enhancement: classify_outcome(Some(&decision), inputs.carried_audio.as_ref(), audio),
+        video_copied: super::plan::decision_video(&decision) == Some("copy"),
         qsess,
     })
 }
@@ -9080,7 +9137,7 @@ pub(super) fn commit_retranscode(
         "retranscode rk={} audio={} sub={} offset={} -> transcode start",
         inputs.rk, inputs.audio_sid, inputs.subtitle_sid, inputs.offset_secs,
     ));
-    let PreparedEncode { qsess, url, vcodec, acodec, contract, enhancement } = prepared;
+    let PreparedEncode { qsess, url, vcodec, acodec, contract, enhancement, video_copied } = prepared;
     Ok(AppliedRetranscode {
         qsess,
         url,
@@ -9088,6 +9145,7 @@ pub(super) fn commit_retranscode(
         acodec,
         contract,
         enhancement,
+        video_copied,
         ticket,
         client: inputs.client,
         superseded,
@@ -9162,8 +9220,24 @@ pub(super) fn apply_retranscode_outcome_to_projection(p: &mut AppliedRouteProjec
     p.stream_vcodec = applied.vcodec.clone();
     p.stream_acodec = applied.acodec.clone();
     p.stream_fps = 0.0;
-    p.stream_dovi = plx_data::metadata::Dovi::NONE;
-    p.stream_dv_decision = plx_data::metadata::DvDecision::NONE;
+    // FORK (RichiL10): an audio pick or a seek on a route whose server COPIES the HEVC video
+    // keeps the source's Dolby Vision declaration (direct play's, or the remux's own): the
+    // bitstream, RPUs included, is the same one. Any re-encode clears it as before.
+    let keeps_dv = plx_base::forkknobs::is("remux_dv", "on", "on")
+        && applied.contract.remux
+        && applied.video_copied
+        && applied.vcodec.eq_ignore_ascii_case("hevc")
+        && p.stream_dv_decision.presentation.declared().is_some();
+    if keeps_dv {
+        crate::player::log(&format!(
+            "route: rebuilt remux keeps Dolby Vision (P{}{}, video copy)",
+            p.stream_dovi.profile,
+            if p.stream_dovi.converts_to_p81() { "->8.1" } else { "" },
+        ));
+    } else {
+        p.stream_dovi = plx_data::metadata::Dovi::NONE;
+        p.stream_dv_decision = plx_data::metadata::DvDecision::NONE;
+    }
     p.stream_immersive = false;
 }
 

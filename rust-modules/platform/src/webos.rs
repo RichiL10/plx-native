@@ -450,6 +450,27 @@ pub fn system_locale() -> crate::tv::LocaleReply {
     crate::tv::LocaleReply::NoPlatform
 }
 
+/// Read the current sound route with the same 600 ms settingsservice budget as locale.
+#[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+pub fn sound_output() -> crate::tv::SoundOutputReply {
+    let result = ls2::register()
+        .map_err(ls2::Fail::from)
+        .and_then(|client| client.call(
+            "luna://com.webos.settingsservice/getSystemSettings",
+            r#"{"category":"sound","keys":["soundOutput"]}"#,
+            std::time::Duration::from_millis(600),
+        ));
+    match result {
+        Ok(raw) => crate::tv::SoundOutputReply::Reply(raw),
+        Err(_) => crate::tv::SoundOutputReply::Unavailable,
+    }
+}
+
+#[cfg(any(feature = "hostsim", test, feature = "test-support"))]
+pub fn sound_output() -> crate::tv::SoundOutputReply {
+    crate::tv::SoundOutputReply::NoPlatform
+}
+
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
 fn launch_home() -> bool {
     let payload = format!("{{\"id\":\"{HOME_APP_ID}\"}}");
