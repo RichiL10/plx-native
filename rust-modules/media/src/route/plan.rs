@@ -2859,6 +2859,8 @@ pub(super) fn pick_dp_audio_pref(
 
 pub(super) fn audio_direct_plays(mode: DirectPlayMode, codec: &str, channels: i64) -> bool {
     if mode == DirectPlayMode::Forced {
+        // FORK (RichiL10): PMS's `dca` / `dca-ma` is the `dts` of the feed set.
+        let codec = plx_platform::devcaps::dp_audio_key(codec);
         plx_plex::plex::DP_AUDIO_CODECS.split(',').any(|c| c.eq_ignore_ascii_case(codec))
     } else {
         plx_plex::plex::is_dp_audio_track(codec, channels)

@@ -56,6 +56,19 @@ pub mod dv;
 /// (`plex::DP_AUDIO_CODECS`) for the profile string and route's plan.
 pub const DP_AUDIO_CODECS: &str = "aac,ac3,eac3,dts";
 
+/// FORK (RichiL10): the key [`DP_AUDIO_CODECS`] and [`Caps::audio`] know a codec by. PMS reports
+/// every DTS flavour as `dca` (libavcodec's old decoder name), `dca-ma`, `dca-hra` and friends on
+/// a Media whose track is DTS-HD, while this set, the television's codec table ("DTS") and the
+/// bundled FFmpeg (`dts`) all say `dts`. Without the fold a DTS track off a real server never
+/// matched the set and was always converted by the server. Anything else passes through unchanged.
+pub fn dp_audio_key(codec: &str) -> &str {
+    if codec.eq_ignore_ascii_case("dca") || codec.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("dca-")) {
+        "dts"
+    } else {
+        codec
+    }
+}
+
 const CAPS_TABLE: &str = "/etc/umediaserver/device_codec_capability_config.json";
 
 /// The decode-capability snapshot the playback stack derives from. `OnceLock` for the same
@@ -138,11 +151,14 @@ impl Caps {
 
     /// Membership test on [`Caps::audio`] — `codec` already lowercase (PMS codec ids are).
     pub fn audio_has(&self, codec: &str) -> bool {
+        // FORK (RichiL10): PMS's `dca` / `dca-ma` is `dts` here.
+        let codec = dp_audio_key(codec);
         self.audio.split(',').any(|c| c == codec)
     }
 
     /// Local counterpart of the profile's codec-scoped audio.channels limitations.
     pub fn audio_supports(&self, codec: &str, channels: i64) -> bool {
+        let codec = dp_audio_key(codec);
         if !self.audio_has(codec) {
             return false;
         }
@@ -563,6 +579,28 @@ mod tests {
         let unbounded = parse(&REAL.replace("\"channels\" : 6", "\"channels\" : 0")).unwrap();
         assert!(!unbounded.audio_has("dts"));
         assert!(!Caps::assumed().audio_supports("truehd", 6));
+    }
+
+    /// FORK (RichiL10): PMS names every DTS track `dca` (`dca-ma` on DTS-HD MA). The gate must
+    /// give it exactly the answer it gives `dts`, channel bound included, or a real server's DTS
+    /// is never direct-played.
+    #[test]
+    fn pms_spells_dts_dca_and_the_gate_folds_it() {
+        assert_eq!(dp_audio_key("dca"), "dts");
+        assert_eq!(dp_audio_key("dca-ma"), "dts");
+        assert_eq!(dp_audio_key("DCA"), "dts");
+        assert_eq!(dp_audio_key("dts"), "dts");
+        for other in ["ac3", "eac3", "aac", "truehd", "dcafoo", ""] {
+            assert_eq!(dp_audio_key(other), other);
+        }
+        let caps = parse(REAL).unwrap();
+        for codec in ["dca", "dca-ma"] {
+            assert!(caps.audio_has(codec), "{codec}");
+            assert!(caps.audio_supports(codec, 6), "{codec}");
+            assert!(!caps.audio_supports(codec, 8), "{codec}: the device's 6-channel bound holds");
+            assert!(!caps.audio_supports(codec, 0), "{codec}: DTS needs a known channel count");
+        }
+        assert!(!Caps::assumed().audio_has("dca"), "no DTS row, no DTS under any spelling");
     }
 
     /// The merge is per-AXIS min, not a pick of the smaller row: a table whose duplicate rows

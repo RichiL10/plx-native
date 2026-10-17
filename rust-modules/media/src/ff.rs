@@ -701,6 +701,9 @@ unsafe fn audio_stream_matching(fmt: *mut AVFormatContext, want: &str) -> Option
     if want.is_empty() {
         return None;
     }
+    // FORK (RichiL10): PMS spells DTS `dca` (`dca-ma` etc. on a DTS-HD Media), the bundled
+    // FFmpeg's `avcodec_get_name` says `dts`: same track, two spellings.
+    let want = plx_platform::devcaps::dp_audio_key(want);
     let streams = (*fmt).streams;
     for i in 0..(*fmt).nb_streams {
         let cp = stream_codecpar(*streams.add(i as usize));
