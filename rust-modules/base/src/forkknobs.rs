@@ -22,7 +22,7 @@
 //! | `dts_core`     | `auto`, `never`               | gate: DTS-HD above the TV's DTS channel ceiling plays as its core (`never` = the server converts it) |
 //! | `encode`       | `ac3`, `off`                  | feed: FLAC/PCM above the PCM lane's channels and TrueHD/MLP (48 kHz) decoded and encoded to AC3 5.1 640 kbps in-app (`off` = the server converts them) |
 //! | `remux_dv`     | `on`, `off`                   | route: a server remux that copies the HEVC video declares the source's Dolby Vision as direct play does (`off` = declare nothing) |
-//! | `encode_audio` | `auto`, `ac3`, `eac3`         | route: what the server encodes a track the TV cannot take into, off an optical output (`auto` = E-AC3 then AC3); optical is always AC3 |
+//! | `encode_audio` | `auto`, `ac3`, `eac3`         | route: what the server encodes a track the TV cannot take into, off an optical output (`auto` = E-AC3 then AC3); optical is always AC3, and so is an output the TV did not report unless this says `eac3` |
 //! | `sub_burn`     | `never4k`, `allow`            | route: never have the server burn a subtitle into a source wider than 1920 or with Dolby Vision/HDR (`allow` = upstream's burn) |
 //!
 //! The file is re-read when its modification time changes, at most once per second, so a change

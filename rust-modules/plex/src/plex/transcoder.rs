@@ -370,7 +370,9 @@ fn sound_output_value() -> String {
 ///   (S/PDIF) output that is AC3 alone: optical carries Dolby Digital 5.1 at most, and DD+ would
 ///   be decoded and re-encoded to DD by the TV, a second lossy pass. Elsewhere `eac3,ac3`, which
 ///   keeps up to 7.1. Knob `encode_audio=ac3|eac3|auto` decides off optical (`auto`, the default,
-///   is `eac3,ac3`); on optical it is AC3 whatever the knob says.
+///   is `eac3,ac3`); on optical it is AC3 whatever the knob says. An output settingsservice did
+///   not report (`unknown`) is treated as optical unless the knob says `eac3`: AC3 is the one
+///   encode every output carries, so a failed read can cost 7.1 but never the surround.
 /// * `CopyLane(codec)`: the fork-lane track is named first so the remux copies it.
 /// * `Unknown`: the established copy-lane list, AC3-first on optical, E-AC3-first elsewhere.
 fn target_audio(
@@ -381,8 +383,9 @@ fn target_audio(
 ) -> String {
     use super::params::AudioTarget;
     let optical = output.to_ascii_lowercase().contains("optical");
+    let unreported = output == "unknown" && knob != Some("eac3");
     let has = |c: &&str| caps.audio_has(c);
-    let lanes: Vec<&str> = if optical || knob == Some("ac3") {
+    let lanes: Vec<&str> = if optical || unreported || knob == Some("ac3") {
         ["ac3", "eac3", "aac", "dts"].into_iter().filter(has).collect()
     } else {
         ["eac3", "ac3", "aac", "dts"].into_iter().filter(has).collect()
@@ -391,7 +394,7 @@ fn target_audio(
         AudioTarget::Encode => {
             // An optical (S/PDIF) output carries Dolby Digital 5.1 at most, whatever the knob asks.
             let wanted: &[&str] = match knob {
-                _ if optical => &["ac3"],
+                _ if optical || unreported => &["ac3"],
                 Some("ac3") => &["ac3"],
                 _ => &["eac3", "ac3"],
             };
@@ -1450,7 +1453,11 @@ mod tests {
         // optical: AC3 only (DD 5.1 is the most S/PDIF carries; DD+ would be re-encoded by the TV)
         assert_eq!(t(AudioTarget::Encode, "external_optical", None), "ac3");
         assert_eq!(t(AudioTarget::Encode, "external_arc", None), "eac3,ac3");
-        assert_eq!(t(AudioTarget::Encode, "unknown", None), "eac3,ac3");
+        // an output settingsservice did not report counts as optical unless the knob says eac3
+        assert_eq!(t(AudioTarget::Encode, "unknown", None), "ac3");
+        assert_eq!(t(AudioTarget::Encode, "unknown", Some("auto")), "ac3");
+        assert_eq!(t(AudioTarget::Encode, "unknown", Some("eac3")), "eac3,ac3");
+        assert_eq!(t(AudioTarget::Unknown, "unknown", None), "ac3,eac3,aac,dts");
         assert_eq!(t(AudioTarget::Encode, "external_arc", Some("ac3")), "ac3");
         assert_eq!(t(AudioTarget::Encode, "external_arc", Some("eac3")), "eac3,ac3");
         assert_eq!(t(AudioTarget::Encode, "external_arc", Some("auto")), "eac3,ac3");
