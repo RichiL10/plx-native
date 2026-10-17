@@ -2794,10 +2794,22 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine) {
     // demuxer proved audioless may use the video-only escape; `abuf <= 0` alone is starvation, not
     // evidence that no audio exists.
     let audio_expected = SHARED.hls_audio_expected.load(Ordering::Acquire) || playable_abuf > 0;
+    // FORK (RichiL10): **a full native sink is a primed decoder.** `pending_video` held with the
+    // feeder parked on BufferFull means Starfish's own source buffer (`srcBufferLevelVideo`,
+    // 8 MiB) holds every byte of video it will take. At a UHD remux's 90-130 Mbit/s that is
+    // 0.5-0.75 s, UNDER `PRIME_NS`, and while the clock is held the presented position never
+    // moves, so `accepted_vbuf >= PRIME_NS` can never come true. Measured on an LG B4 (0.8 fork):
+    // a viewer's Resume on an 89.6 Mbit/s Dolby Vision remux logged `queued Resume feeding;
+    // physical Play awaits balanced prime` and then nothing, until a full reload. 0.9's queued
+    // runway rule relaxes the runway half of the prime, not this accepted-video floor. Waiting for
+    // more accepted video than the sink can hold is waiting for nothing; the audio floor still
+    // applies, so the audioSync master clock never starts on an empty audio lane.
+    let video_sink_full =
+        eng.pending_video.is_some() && SHARED.dg_feed_state.load(Ordering::Relaxed) == 2 && accepted_vbuf > 0;
     let decoder_ready = if audio_expected {
-        accepted_vbuf >= PRIME_NS && accepted_abuf >= PRIME_AUDIO_NS
+        (accepted_vbuf >= PRIME_NS || video_sink_full) && accepted_abuf >= PRIME_AUDIO_NS
     } else {
-        accepted_vbuf >= PRIME_VIDEO_MAX_NS
+        accepted_vbuf >= PRIME_VIDEO_MAX_NS || video_sink_full
     };
     let recovery = SHARED.hls_recovery();
     // A downshift has no discretionary trial reserve, yet it can queue candidate AUs while an
@@ -2858,10 +2870,15 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine) {
                     ));
                 } else {
                     log(&format!(
-                        "primed: v={}ms a={}ms runway={}ms -> Play",
+                        "primed: v={}ms a={}ms runway={}ms{} -> Play",
                         playable_vbuf / 1_000_000,
                         playable_abuf / 1_000_000,
                         observed_runway_ns / 1_000_000,
+                        if video_sink_full && accepted_vbuf < PRIME_NS {
+                            " (native video sink full below PRIME_NS)"
+                        } else {
+                            ""
+                        },
                     ));
                 }
             }
@@ -4941,6 +4958,97 @@ mod prime_livelock_tests {
             !eng.prime_play,
             "balanced accepted A/V plus validated queued runway did not release ResumePrime",
         );
+    }
+
+    /// FORK (RichiL10): a paused UHD remux. Starfish's 8 MiB source buffer took 500 ms of video
+    /// (under `PRIME_NS`) and replies BufferFull, the clock is held so the presented position
+    /// never moves, and the audio floor is met. Before the fix the ResumePrime waited forever;
+    /// a full native video sink must count as a primed decoder, while an accepting sink with the
+    /// same 500 ms must still wait.
+    #[test]
+    fn a_full_native_video_sink_releases_resume_prime_below_prime_ns() {
+        let _serial = plx_base::testlock::serial();
+        struct Restore {
+            runway: i64,
+            video_tail: i64,
+            audio_tail: i64,
+            audio_expected: bool,
+            pts_shift: i64,
+            presented: i64,
+            paused: bool,
+            feed_state: u8,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SHARED.hls_prime_runway_ms.store(self.runway, Ordering::Relaxed);
+                SHARED.hls_video_tail_ns.store(self.video_tail, Ordering::Relaxed);
+                SHARED.hls_audio_tail_ns.store(self.audio_tail, Ordering::Relaxed);
+                SHARED.hls_audio_expected.store(self.audio_expected, Ordering::Relaxed);
+                SHARED.pts_shift.store(self.pts_shift, Ordering::Relaxed);
+                SHARED.pres_fed.store(self.presented, Ordering::Relaxed);
+                SHARED.dg_feed_state.store(self.feed_state, Ordering::Relaxed);
+                TX.commit_paused(self.paused);
+                SHARED.reset_hls_clock_for_test();
+                crate::player::ffi_host::force_clocksink_for_test(false);
+            }
+        }
+
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.reset_hls_clock_for_test();
+        let base = 10_000_000_000;
+        let _restore = Restore {
+            runway: SHARED.hls_prime_runway_ms.swap(3_000, Ordering::Relaxed),
+            video_tail: SHARED.hls_video_tail_ns.swap(base + 3_500_000_000, Ordering::Relaxed),
+            audio_tail: SHARED.hls_audio_tail_ns.swap(base + 3_500_000_000, Ordering::Relaxed),
+            audio_expected: SHARED.hls_audio_expected.swap(true, Ordering::Relaxed),
+            pts_shift: SHARED.pts_shift.swap(0, Ordering::Relaxed),
+            presented: SHARED.pres_fed.swap(base, Ordering::Relaxed),
+            paused: TX.paused.swap(true, Ordering::Relaxed),
+            feed_state: SHARED.dg_feed_state.swap(1, Ordering::Relaxed),
+        };
+        let pause = match SHARED.prepare_hls_user_pause().expect("reserve user Pause") {
+            super::super::shared::HlsUserPause::Issue(token) => token,
+            other => panic!("unexpected Pause reservation: {other:?}"),
+        };
+        assert_eq!(
+            SHARED.complete_hls_user_pause(pause, true),
+            super::super::shared::HlsPauseCompletion::Accepted
+        );
+        assert_eq!(SHARED.prepare_hls_user_resume(true), Some(super::super::shared::HlsUserResume::Prime));
+
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        let mut eng = engine_after_reload();
+        eng.prime_play = false;
+        arm_live_clock_prime(&mut eng);
+        assert_eq!(eng.seek_base_pts, base);
+        TX.commit_paused(false);
+        // What Starfish accepted before its source buffer filled: 500 ms of video, audio past its floor.
+        eng.max_fed_video_pts = base + 500_000_000;
+        eng.max_fed_audio_pts = base + PRIME_AUDIO_NS + 100_000_000;
+        let before = crate::player::ffi_host::play_calls_for_test();
+        try_prime(&mt, &mut eng);
+        assert_eq!(
+            crate::player::ffi_host::play_calls_for_test(),
+            before,
+            "an ACCEPTING sink with 500 ms of video is not primed yet",
+        );
+        assert!(eng.prime_play);
+
+        // The video lane parks on BufferFull holding the next AU.
+        push_segment_at(&mut eng, base + 500_000_000);
+        let mut eof: c_int = 0;
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        let n = crate::aq::aq_pop(qv, &mut eof);
+        assert!(!n.is_null());
+        eng.pending_video = Some(AuBox(n));
+        SHARED.dg_feed_state.store(2, Ordering::Relaxed);
+        try_prime(&mt, &mut eng);
+        assert_eq!(
+            crate::player::ffi_host::play_calls_for_test(),
+            before + 1,
+            "a full native video sink below PRIME_NS must release the ResumePrime",
+        );
+        assert!(!eng.prime_play);
     }
 
     /// A `Play` request is an actuator command, not confirmation that the media clock moved. If
