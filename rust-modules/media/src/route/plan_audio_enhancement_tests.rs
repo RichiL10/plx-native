@@ -268,6 +268,9 @@ fn dv_unusable_base_is_disabled_not_offered() {
 fn embedded_default_subtitle_with_enhancement_is_burned() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     let r = resolve(&mut ps, MDE_DIRECTPLAY, EnhMode::Honor("ac3"), 0, MKV, "ac3",
         |sid| fourk_item_with_subs(sid, vec![track(1, "ac3", 2, true)], vec![selected_sub(9, "srt")]),
         |_, _| {});
@@ -428,6 +431,9 @@ fn direct_play_start_leaves_the_servers_selected_download_alone() {
 fn a_viewer_pick_made_before_play_still_wins_over_the_servers_selection() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     let r = resolve(&mut ps, MDE_DIRECTPLAY, EnhMode::Honor("ac3"), 0, MKV, "ac3",
         embedded_english_and_selected_download, |env, _| env.subtitle_override = Some(5));
     // (over this 48 Mbit/s Part the embedded track is burned, M7; only the selection is graded)
@@ -507,6 +513,9 @@ fn cold_reresolve_of_a_drawn_embedded_track_burns_where_the_reader_is_not_admitt
     ] {
         let mut ps = PlaybackSession::IDLE;
         let _g = fresh_registry(&mut ps);
+        // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+        // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+        set_sub_burn_for_test(Some(true));
         let r = resolve(&mut ps, MDE_DIRECTPLAY, EnhMode::Honor("ac3"), 0, MKV, "truehd",
             |sid| {
                 let mut item = fourk_item(sid, vec![track(1, "truehd", 8, true)]);
@@ -897,6 +906,9 @@ fn episode_with_an_unselected_subtitle(
 fn q_top_b_the_forced_burn_carries_the_remembered_subtitle() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     let r = resolve(&mut ps, MDE_DIRECTPLAY, EnhMode::Honor("ac3"), 0, MKV, "ac3",
         |sid| episode_with_an_unselected_subtitle(sid, vec![track(1, "ac3", 2, true)]),
         |env, _| env.memory = remembers_english_subtitle());
@@ -916,6 +928,9 @@ fn q_top_b_the_forced_burn_carries_the_remembered_subtitle() {
 fn q_top_b_a_refused_enhancement_falls_back_to_a_direct_play_with_no_burn() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     let r = resolve(&mut ps, MDE_DIRECTPLAY, EnhMode::Refuse, 0, MKV, "ac3",
         |sid| episode_with_an_unselected_subtitle(sid, vec![track(1, "ac3", 2, true)]),
         |env, _| env.memory = remembers_english_subtitle());
@@ -942,6 +957,9 @@ fn q_top_b_a_refused_enhancement_falls_back_to_a_direct_play_with_no_burn() {
 fn q_top_b_a_refused_forced_burn_keeps_the_remembered_subtitle() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     let r = resolve(&mut ps, MDE_TRANSCODE_COPY, EnhMode::Refuse, 0, MKV, "truehd",
         |sid| episode_with_an_unselected_subtitle(sid, vec![track(1, "truehd", 8, true)]),
         |env, _| env.memory = remembers_english_subtitle());
@@ -975,5 +993,90 @@ fn burn_route_offered_but_no_enhancement_wanted_is_not_forced_into_a_re_encode()
     for d in transcode_decisions(&r.requests) {
         assert!(!d.contains("subtitles=burn"), "nothing burns: {d}");
     }
+    plx_plex::plex::reset_servers_for_test();
+}
+
+// ---- FORK (RichiL10): pacchetto 7, the cold start of a 4K Dolby Vision film -------------------
+
+/// "Le due torri" as the server must remux it (its audio converted by the server: TrueHD here, the
+/// host caps having no lane), with a subtitle the series memory remembered.
+fn le_due_torri_episode(sid: ServerId) -> plx_data::metadata::PlayingItem {
+    let mut item = episode_with_an_unselected_subtitle(sid, vec![track(1, "truehd", 8, true)]);
+    item.dovi = plx_data::metadata::Dovi { present: true, profile: 7, bl_compat: 6, el_present: true, ..plx_data::metadata::Dovi::NONE };
+    item.hdr = true;
+    item.bitrate = 66_000;
+    item
+}
+
+/// B2 + B4 at the cold start: a remembered per-series subtitle on a 4K DV film whose audio only the
+/// server converts. The remux copies the video and declares the source's Dolby Vision (P7, fed as
+/// 8.1) exactly as direct play would, and nothing is burned, with the audio enhancement off and
+/// with it on (upstream's forced burn, refused under `sub_burn=never4k`).
+#[test]
+#[cfg(feature = "devtriggers")]
+fn fork_cold_start_remembered_subtitle_on_a_4k_dv_film_keeps_dv_and_burns_nothing() {
+    for enh in [plx_plex::plex::AudioEnhancements::NONE, PREF] {
+        let mut ps = PlaybackSession::IDLE;
+        let _g = fresh_registry(&mut ps);
+        let r = resolve(&mut ps, MDE_TRANSCODE_COPY, EnhMode::Honor("ac3"), 0, MKV, "truehd",
+            le_due_torri_episode,
+            |env, _| {
+                env.memory = remembers_english_subtitle();
+                env.audio_enhancements = enh;
+                env.dv_capability = Some(plx_platform::devcaps::dv::DvCapability::Supported);
+            });
+        assert!(r.plan.url.contains("start.mkv") && r.plan.contract.remux, "{enh:?}: a copy: {}", r.plan.url);
+        for d in transcode_decisions(&r.requests) {
+            assert!(!d.contains("subtitles=burn"), "{enh:?}: nothing burns: {d}");
+            assert!(!d.contains("maxVideoBitrate") && !d.contains("videoResolution"), "{enh:?}: no cap: {d}");
+        }
+        assert!(!r.plan.url.contains("subtitles=burn"), "{enh:?}: {}", r.plan.url);
+        assert!(r.plan.dv_decision.presentation.declared().is_some(), "{enh:?}: the copy declares DV");
+        assert_eq!(r.plan.dovi.profile, 7, "{enh:?}");
+        assert!(r.plan.source_dovi.converts_to_p81() && r.plan.source_hdr, "{enh:?}: the item's facts");
+        plx_plex::plex::reset_servers_for_test();
+    }
+}
+
+/// Defect (b) at a cold re-resolve (a retry or restart): a subtitle the session carried that the
+/// server would have to burn into the 66 Mbit/s DV copy is not burned: the wire says
+/// `subtitles=none`, the route stays the copy with its Dolby Vision.
+#[test]
+#[cfg(feature = "devtriggers")]
+fn fork_cold_reresolve_carrying_a_burn_into_a_4k_dv_copy_sends_none() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let r = resolve(&mut ps, MDE_TRANSCODE_COPY, EnhMode::Honor("ac3"), 0, MKV, "truehd",
+        le_due_torri_episode,
+        |env, _| {
+            env.audio_enhancements = plx_plex::plex::AudioEnhancements::NONE;
+            env.dv_capability = Some(plx_platform::devcaps::dv::DvCapability::Supported);
+            env.sub_sid = 77;
+            env.sub_drawn = Some(0);
+        });
+    assert!(r.plan.contract.remux, "{}", r.plan.url);
+    assert_eq!(query_param(&r.plan.url, "subtitles"), Some("none"), "{}", r.plan.url);
+    for d in transcode_decisions(&r.requests) {
+        assert!(!d.contains("subtitles=burn"), "{d}");
+    }
+    assert!(r.plan.dv_decision.presentation.declared().is_some());
+    plx_plex::plex::reset_servers_for_test();
+}
+
+/// The control: `sub_burn=allow` gives the same carried subtitle upstream's burn.
+#[test]
+#[cfg(feature = "devtriggers")]
+fn fork_cold_reresolve_with_sub_burn_allow_keeps_upstreams_burn() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    set_sub_burn_for_test(Some(true));
+    let r = resolve(&mut ps, MDE_TRANSCODE_COPY, EnhMode::Honor("ac3"), 0, MKV, "truehd",
+        le_due_torri_episode,
+        |env, _| {
+            env.audio_enhancements = plx_plex::plex::AudioEnhancements::NONE;
+            env.sub_sid = 77;
+            env.sub_drawn = Some(0);
+        });
+    assert_ne!(query_param(&r.plan.url, "subtitles"), Some("none"), "{}", r.plan.url);
     plx_plex::plex::reset_servers_for_test();
 }

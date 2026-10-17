@@ -1532,6 +1532,245 @@ fn fork_an_enhanced_remux_is_not_released_by_a_pick() {
     cleanup(&mut ps);
 }
 
+// ---- FORK (RichiL10): task D, subtitles keep Dolby Vision and direct play; no 4K/DV burn -----
+
+fn dv_p7() -> plx_data::metadata::Dovi {
+    plx_data::metadata::Dovi { present: true, profile: 7, bl_compat: 6, el_present: true, ..plx_data::metadata::Dovi::NONE }
+}
+
+fn dv_declared() -> plx_data::metadata::DvDecision {
+    plx_data::metadata::DvDecision {
+        capability: plx_platform::devcaps::dv::DvCapability::Supported,
+        presentation: plx_data::metadata::DvPresentation::Declare(plx_data::metadata::DolbyHdrInfo {
+            profile_id: 8,
+            track_type: "single",
+            encryption_type: "clear",
+        }),
+    }
+}
+
+/// The source of the device report: 4K HEVC, Dolby Vision P7, the facts frozen at playback start.
+fn make_4k_dv_source(ps: &mut PlaybackSession) {
+    ps.cur_src = (60_000, 3_840, 2_160);
+    ps.item_dovi = dv_p7();
+    ps.item_dv_decision = dv_declared();
+}
+
+/// FORK (RichiL10) D1: the item's DV facts survive any route that dropped them and are declared
+/// again by the next route that copies the video; a re-encode or an undeclared item gets none.
+#[test]
+fn fork_copied_video_dv_prefers_the_item_facts() {
+    let none = (plx_data::metadata::Dovi::NONE, plx_data::metadata::DvDecision::NONE);
+    let item = (dv_p7(), dv_declared());
+    assert_eq!(copied_video_dv(item, none).map(|(d, _)| d.profile), Some(7));
+    assert_eq!(copied_video_dv(none, item).map(|(d, _)| d.profile), Some(7));
+    assert!(copied_video_dv(none, none).is_none());
+}
+
+/// FORK (RichiL10) D1 (brief test 1): a burn on a DV source (`sub_burn=allow`) dropped the
+/// declaration; turning the subtitle Off rebuilds the video-copy remux, which declares it again.
+#[test]
+fn fork_subtitle_off_after_a_dv_burn_restores_dolby_vision_on_the_remux() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    set_sub_burn_for_test(Some(true));
+    let live = Live::start(EnhMode::Honor("ac3"));
+    let mut cand = candidate(true, a4(), Some(2));
+    cand.audio_converted = true;
+    install(&mut ps, &live, Delivery::Burn(NONE), a4(), Some(cand), 77);
+    make_4k_dv_source(&mut ps);
+    ps.cur_sub_client_drawable = true;
+    ps.cur_sub_ordinal = 2;
+    assert!(live_is_original_burn(&ps), "fixture: a plain Original-quality burn");
+    assert_eq!(stream_dv_decision(&ps), plx_data::metadata::DvDecision::NONE, "the burn declares nothing");
+    commit_subtitle_selection(&mut ps, -1, 0, false);
+    assert!(pending_user_route_intent(UserRouteIntent::Retranscode), "TrueHD cannot direct-play: a rebuild");
+    let (action, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Retranscode);
+    settle(&mut ps, &action, tail);
+    assert!(ps.cur_contract.remux, "Off returns to the video-copy remux");
+    assert_eq!(stream_dv_decision(&ps), dv_declared(), "the copy declares the source's DV again");
+    assert_eq!(stream_dovi(&ps).profile, 7);
+    assert!(frozen_route_declares_dv(), "the applied projection carries it to the demuxer");
+    let requests = live.finish();
+    let last = *decisions(&requests).last().expect("a decision was made");
+    assert_eq!(query_param(last, "subtitles"), None, "{last}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D2 (brief test 2): on the fork's plain remux with an audio the TV decodes, an
+/// embedded subtitle pick goes back to the file with the subtitle drawn by the app.
+#[test]
+fn fork_an_embedded_subtitle_pick_on_the_remux_releases_to_the_file() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install(&mut ps, &live, Delivery::Remux(NONE), a1(), Some(candidate(true, a1(), None)), 0);
+    make_4k_dv_source(&mut ps);
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    assert_eq!(ps.auto_original.as_ref().and_then(|c| c.subtitle_ordinal), Some(2), "the candidate carries the pick");
+    let (action, tail) = claim(&mut ps);
+    // The pick was applied in place first (withheld over the 4K DV copy, D3), so a refused
+    // release owes nothing: the in-place commit already is the applied route.
+    assert!(!action.displaced_pick);
+    assert_eq!(tail, ClaimTail::Original(AutoOriginalReload::Direct));
+    assert!(!is_transcoding(&ps), "back to the raw Part");
+    assert_eq!(ps.cur_sub_sid, 77);
+    assert_eq!(crate::player::desired_sub_idx(), 2, "the app draws the picked track");
+    assert_eq!(subtitle_presenter(&ps), SubtitlePresenter::Client);
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "no burn was asked for: {requests:?}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D2 fallback: a release refused at claim time leaves the in-place pick standing,
+/// which on a 4K DV source is the kept video copy with the subtitle withheld (D3), never a burn.
+#[test]
+fn fork_a_refused_subtitle_release_keeps_the_copy_on_a_4k_dv_source() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install(&mut ps, &live, Delivery::Remux(NONE), a1(), Some(candidate(true, a1(), None)), 0);
+    make_4k_dv_source(&mut ps);
+    let url = ps.url.clone();
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    ps.auto_original = None;
+    let (action, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Rejected(ENHANCEMENT_REJECTED));
+    settle(&mut ps, &action, tail);
+    assert!(is_transcoding(&ps) && ps.cur_contract.remux, "the video copy is kept");
+    assert_eq!(ps.url, url);
+    assert_eq!(ps.cur_sub_sid, 77, "the in-place pick survives the rejection");
+    assert_eq!(subtitle_presenter(&ps), SubtitlePresenter::Withheld);
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "no burn was asked for: {requests:?}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D2 fallback below 4K: a refused release owes the pick its own rebuild, which
+/// on a 1080p SDR source is upstream's burn.
+#[test]
+fn fork_a_refused_subtitle_release_burns_on_a_1080p_source() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install(&mut ps, &live, Delivery::Remux(NONE), a1(), Some(candidate(true, a1(), None)), 0);
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    ps.auto_original = None;
+    let (action, tail) = claim(&mut ps);
+    assert!(action.displaced_pick);
+    assert_eq!(tail, ClaimTail::Retranscode, "the Legacy fallback rebuilt the stream");
+    settle(&mut ps, &action, tail);
+    assert!(!ps.cur_contract.remux, "the burn");
+    let requests = live.finish();
+    let last = *decisions(&requests).last().expect("the fallback asked for the burn");
+    assert_eq!(query_param(last, "subtitles"), Some("burn"), "{last}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D2: Off on a plain Original-quality burn whose audio the TV decodes releases to
+/// the file instead of asking for a remux.
+#[test]
+fn fork_subtitle_off_on_a_burn_with_playable_audio_releases_to_the_file() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install(&mut ps, &live, Delivery::Burn(NONE), a1(), Some(candidate(true, a1(), Some(2))), 77);
+    assert!(live_is_original_burn(&ps));
+    commit_subtitle_selection(&mut ps, -1, 0, false);
+    assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    let (_, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Original(AutoOriginalReload::Direct));
+    assert!(!is_transcoding(&ps));
+    assert_eq!(crate::player::desired_sub_idx(), -1);
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "{requests:?}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D2 guard: a fixed quality rung never releases, the pick keeps its own rebuild.
+#[test]
+fn fork_a_subtitle_pick_on_a_fixed_rung_does_not_release() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    restore_quality(Quality::P720);
+    install(&mut ps, &live, Delivery::Remux(NONE), a1(), Some(candidate(true, a1(), None)), 0);
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(!pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    assert!(pending_user_route_intent(UserRouteIntent::Retranscode));
+    live.finish();
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D3 (brief test 3): audio only the server converts, an embedded pick the app
+/// cannot draw over the remux, a 4K DV source: no rebuild, no burn, the stream kept and nothing
+/// drawn; a later rebuild (a seek) stays the copy.
+#[test]
+fn fork_no_burn_into_a_4k_dv_source_keeps_the_copy_and_withholds_the_subtitle() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    make_4k_dv_source(&mut ps);
+    let url = ps.url.clone();
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(!pending_user_route_intent(UserRouteIntent::Retranscode), "no rebuild");
+    assert!(!pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
+    assert_eq!(ps.url, url, "the live stream is kept");
+    assert_eq!(ps.cur_sub_sid, 77, "the pick is recorded");
+    assert_eq!(subtitle_presenter(&ps), SubtitlePresenter::Withheld);
+    assert!(subtitles_burned(&ps), "the app draws nothing over the copy");
+    assert!(side_reader_target(&ps).is_none());
+    assert_eq!(live_subtitle_effect(&ps), SubtitleEffect::None);
+    assert_eq!(retranscode_contract(&ps), enhanced_remux_contract(NONE, false), "a seek stays the copy");
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "{requests:?}");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D3: the rule holds for a 4K source without DV and for a DV source below 4K.
+#[test]
+fn fork_burn_refusal_covers_4k_or_dolby_vision() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    ps.cur_src = (60_000, 3_840, 2_160);
+    assert!(burn_refused_for_source(&ps));
+    ps.cur_src = (8_000, 1_920, 1_080);
+    assert!(!burn_refused_for_source(&ps), "a 1080p SDR source still burns");
+    ps.item_dovi = dv_p7();
+    assert!(burn_refused_for_source(&ps));
+    set_sub_burn_for_test(Some(true));
+    assert!(!burn_refused_for_source(&ps), "sub_burn=allow is upstream's burn");
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) D3 with `sub_burn=allow`: upstream's burn.
+#[test]
+fn fork_sub_burn_allow_keeps_the_upstream_burn() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    set_sub_burn_for_test(Some(true));
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    make_4k_dv_source(&mut ps);
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(pending_user_route_intent(UserRouteIntent::Retranscode));
+    let (action, tail) = claim(&mut ps);
+    assert_eq!(tail, ClaimTail::Retranscode);
+    settle(&mut ps, &action, tail);
+    assert!(!ps.cur_contract.remux, "a burn is a real re-encode");
+    assert_eq!(stream_dv_decision(&ps), plx_data::metadata::DvDecision::NONE, "a re-encode declares nothing");
+    assert_eq!(subtitle_presenter(&ps), SubtitlePresenter::ServerBurn(BurnReason::AudioConversion));
+    let requests = live.finish();
+    let last = *decisions(&requests).last().expect("a decision was made");
+    assert_eq!(query_param(last, "subtitles"), Some("burn"), "{last}");
+    cleanup(&mut ps);
+}
+
 // ---- FORK (RichiL10): pacchetto 7 regressions, modelled on "Le due torri" ----------------------
 // DV P7 (bl_compat 6), HEVC 3840x2160 at about 66 Mbit/s, ita DTS core 5.1, eng FLAC 7.1, PGS ita/eng.
 // The host caps are `Caps::assumed()` (aac, ac3, eac3), so the track the TV decodes is an AC3 here
@@ -1540,13 +1779,19 @@ fn fork_an_enhanced_remux_is_not_released_by_a_pick() {
 
 /// Defect (a) of the TV run: picking back to a track the TV decodes left the server's remux
 /// running. The pick now releases the fork's remux back to the file (a fresh direct-play session,
-/// the remux retired by upstream's release once frames confirm), with no new remux asked for.
+/// the remux retired by upstream's release once frames confirm), with no new remux asked for, and
+/// the release keeps the source's Dolby Vision.
 #[test]
 fn fork_le_due_torri_picking_back_to_a_decodable_track_releases_the_remux() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
     let live = Live::start(EnhMode::Honor("ac3"));
     install_fork_remux(&mut ps, &live);
+    make_4k_dv_source(&mut ps);
+    if let Some(c) = ps.auto_original.as_mut() {
+        c.dovi = dv_p7();
+        c.dv_decision = dv_declared();
+    }
     commit_audio_selection(&mut ps, a1());
     assert!(pending_user_route_intent(UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased)));
     let (_, tail) = claim(&mut ps);
@@ -1554,8 +1799,67 @@ fn fork_le_due_torri_picking_back_to_a_decodable_track_releases_the_remux() {
     assert!(!is_transcoding(&ps), "back to the file");
     let fresh = active_encoder();
     assert_ne!(fresh, "enh-remux-1", "the direct play does not own the remux's session");
+    assert_eq!(stream_dv_decision(&ps), dv_declared(), "the direct play declares the source's DV");
     let requests = live.finish();
     assert!(decisions(&requests).is_empty(), "no remux was asked for: {requests:?}");
+    cleanup(&mut ps);
+}
+
+/// Defect (b): a subtitle pick on a 66 Mbit/s DV remux (the side reader refused: the Part is above
+/// its bitrate cap) made the server burn the subtitle, an H.264 4K re-encode that stalled. Now the
+/// pick is committed in place, withheld, and the stream and its Dolby Vision stay exactly as they
+/// were. Defect (c): turning the subtitle Off again keeps the copy and its Dolby Vision, and a later
+/// rebuild (a seek) asks for the copy.
+#[test]
+fn fork_le_due_torri_a_subtitle_on_a_66_mbps_dv_remux_is_withheld_and_off_keeps_dv() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install_fork_remux(&mut ps, &live);
+    make_4k_dv_source(&mut ps);
+    ps.stream_dovi = dv_p7();
+    ps.stream_dv_decision = dv_declared();
+    ps.cur_transport_kbps = 66_000;
+    if let Some(c) = ps.auto_original.as_mut() {
+        c.probe_part = "/library/parts/960001/1/file.mkv".into();
+    }
+    assert!(!side_subs_allowed_for(&ps, 77, true, false), "setup: the side reader is refused at 66 Mbit/s");
+    let url = ps.url.clone();
+    commit_subtitle_selection(&mut ps, 2, 77, true);
+    assert!(!pending_user_route_intent(UserRouteIntent::Retranscode), "no rebuild, no burn");
+    assert_eq!(ps.url, url, "the live remux is kept");
+    assert_eq!(subtitle_presenter(&ps), SubtitlePresenter::Withheld);
+    assert_eq!(stream_dv_decision(&ps), dv_declared(), "the copy keeps its Dolby Vision");
+    assert_eq!(retranscode_contract(&ps), enhanced_remux_contract(NONE, false), "a seek stays the copy");
+    commit_subtitle_selection(&mut ps, -1, 0, false);
+    assert!(!pending_user_route_intent(UserRouteIntent::Retranscode), "Off on the copy changes nothing");
+    assert_eq!(ps.url, url);
+    assert_eq!(subtitle_presenter(&ps), SubtitlePresenter::None);
+    assert_eq!(stream_dv_decision(&ps), dv_declared(), "Off keeps the Dolby Vision declared");
+    assert_eq!(retranscode_contract(&ps), enhanced_remux_contract(NONE, false));
+    let requests = live.finish();
+    assert!(decisions(&requests).is_empty(), "nothing was asked of the server: {requests:?}");
+    cleanup(&mut ps);
+}
+
+/// The knob `sub_burn` read from the conf file: `never4k` is the default, `allow` restores the burn.
+#[test]
+fn fork_knob_sub_burn_reads_never4k_and_allow() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    make_4k_dv_source(&mut ps);
+    for (conf, allowed) in [(None, false), (Some("sub_burn=never4k\n"), false), (Some("sub_burn=allow\n"), true)] {
+        plx_base::forkknobs::with_conf_for_test(conf, || {
+            assert_eq!(sub_burn_allowed(), allowed, "{conf:?}");
+            assert_eq!(burn_refused_for_source(&ps), !allowed, "{conf:?}");
+        });
+    }
+    // HDR10 alone (a 1080p PQ source) is refused too.
+    let mut hdr = PlaybackSession::IDLE;
+    hdr.cur_src = (8_000, 1_920, 1_080);
+    assert!(!burn_refused_for_source(&hdr), "control: a 1080p SDR source burns");
+    hdr.item_hdr = true;
+    assert!(burn_refused_for_source(&hdr));
     cleanup(&mut ps);
 }
 
@@ -2191,6 +2495,9 @@ fn recovery_enhanced_remux_ignored_falls_back_to_plain_original_refused() {
 fn subtitle_repick_while_cold_start_burn_keeps_the_burn() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     restore_quality(Quality::Auto);
     reset_player_control_for_test(&ps);
     crate::player::restore_audio_enhancements(PREF);
@@ -2259,6 +2566,9 @@ fn subtitle_repick_while_cold_start_burn_keeps_the_burn() {
 fn subtitle_first_pick_while_plain_enhanced_remux_burns_it() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): the item is 4K, which the fork never burns into by default (`sub_burn=
+    // never4k`, `burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     restore_quality(Quality::Auto);
     reset_player_control_for_test(&ps);
     crate::player::restore_audio_enhancements(PREF);
@@ -3685,6 +3995,9 @@ fn an_untracked_track_on_a_burned_subtitle_says_not_analyzed() {
 fn a_cold_start_burn_records_the_burned_subtitle_in_the_plan() {
     let mut ps = PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     restore_quality(Quality::Auto);
     reset_player_control_for_test(&ps);
     crate::player::restore_audio_enhancements(PREF);

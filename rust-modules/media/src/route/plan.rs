@@ -1358,6 +1358,16 @@ pub struct Plan {
     /// The direct-play declaration resolved from one cached capability snapshot. Payload builds,
     /// reloads and recovery consume this stored answer; remux/transcode leave it at `NONE`.
     pub dv_decision: plx_data::metadata::DvDecision,
+    /// FORK (RichiL10): the SOURCE file's Dolby Vision layering and the direct-play declaration
+    /// frozen for it, set on EVERY branch that reached the DV gate, whatever route this plan
+    /// installs. Installed as the session's item-level facts (`Session::item_dovi`), which no
+    /// route change clears, so a later route that copies the video again (a remux after a burn,
+    /// after HLS, after a quality change) can restore the declaration direct play would make.
+    pub source_dovi: plx_data::metadata::Dovi,
+    pub source_dv_decision: plx_data::metadata::DvDecision,
+    /// FORK (RichiL10): the SOURCE's video is HDR (`PlayingItem::hdr`), item-level like
+    /// `source_dovi` (`Session::item_hdr`).
+    pub source_hdr: bool,
     /// Does the direct-played audio track carry Dolby Atmos, for the Load payload's
     /// `contents.immersive` node. Set on the DIRECT-PLAY branch only, for the same reason `dovi`
     /// is: it describes the FILE's own elementary stream.
@@ -1610,6 +1620,10 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     #[cfg(not(any(test, feature = "test-support")))]
     let dv_decision = dovi.decision_now(vcodec == "hevc");
     let dv = dv_decision.presentation;
+    // FORK (RichiL10): the item's own DV facts, kept for the whole playback (see `Plan::source_dovi`).
+    plan.source_dovi = dovi;
+    plan.source_dv_decision = dv_decision;
+    plan.source_hdr = plan.playing.as_ref().is_some_and(|p| p.hdr);
     let video_dp = if forced { video_feed_supported(vcodec, dv, plx_platform::devcaps::caps()) } else {
         video_direct_plays(vcodec, src_w, src_h, dv, plx_platform::devcaps::caps())
     };
@@ -2244,7 +2258,12 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     // Rule 3's burn, decided where the route is known: only a route that would otherwise have been
     // the remux becomes the burning re-encode. A fixed rung, a relay, HLS or any other re-encode
     // already was one and keeps what it always sent; so does a file with nothing to stand in.
-    let burn_for_audio = commentary_only_stand_in && remux;
+    // FORK (RichiL10): `sub_burn=never4k` (the default) refuses every burn that would turn this
+    // video copy into a real-time re-encode of a 4K, Dolby Vision or HDR source, the mid-play rule
+    // (`decision::burn_refused_for_source`) at the cold start: the route stays the copy and a
+    // subtitle the app does not draw over it is not shown.
+    let burn_refused = remux && super::decision::burn_refused_for_item(src_w, dovi.present, plan.source_hdr);
+    let burn_for_audio = commentary_only_stand_in && remux && !burn_refused;
     // Issue #266, decided HERE — after the adaptive override has had its say (HLS is `Other`) and
     // before either branch is taken. The enhancement turns the Original route it decorates into
     // a remux (M1: PMS answers either param with a Part transcode, video copy, audio re-encoded
@@ -2264,7 +2283,7 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     // turned one on, so the forced re-encode is spent only when an audio param is actually asked for
     // (`audio.any()`, the same condition `OriginalRecoveryPlan::force_burn_for` applies): with both
     // toggles off the route stays the remux it was, rather than demoting a copy to a burn.
-    let force_burn = audio.any() && matches!(route, Some(EnhancementRoute::Burn));
+    let force_burn = audio.any() && matches!(route, Some(EnhancementRoute::Burn)) && !burn_refused;
     // Remembered for the fallback: a refused enhancement restores the route it decorated.
     let enhanced_from_direct = audio.any() && directplay;
     if audio.any() {
@@ -2340,6 +2359,17 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
     // reporting the id there would make the first rebuild switch the burn off while the menu still
     // named it. That route keeps main's plan; carrying a burn across a remux seek is a follow-up.
     let burn_rides_wire = burn_sub_sid > 0 && reencodes;
+    // FORK (RichiL10): a burn the session carried (`env.sub_sid`) into this copy, refused: the wire
+    // says `subtitles=none` and, as main's plan already does for a copy remux (N2), the plan names
+    // no subtitle, so the film plays without it.
+    let carried_burn_refused = burn_refused && remux && !client_draws && burn_sub_sid > 0 && env.sub_sid == burn_sub_sid;
+    let fork_refused_a_burn = burn_refused
+        && (carried_burn_refused
+            || commentary_only_stand_in
+            || (audio.any() && matches!(route, Some(EnhancementRoute::Burn))));
+    if fork_refused_a_burn {
+        super::decision::log_burn_refused();
+    }
     if burn_for_audio || force_burn || client_draws || reencode_burns_sidecar || burn_rides_wire {
         plan.sub_sid = burn_sub_sid;
     }
@@ -2487,8 +2517,8 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
         &session,
         plx_plex::plex::TranscodeOffset::Fresh,
         encode_audio,
-        if client_draws { 0 } else { burn_sub_sid },
-        client_draws,
+        if client_draws || carried_burn_refused { 0 } else { burn_sub_sid },
+        client_draws || carried_burn_refused,
         plan.contract,
     );
     // The enhanced decision rides the MDE's own `session`, as every remux here always has: M5
@@ -2526,8 +2556,8 @@ pub(super) fn build_stream(off: &plx_base::task::OffFrame, rk: &str, part: &str,
             encode_audio,
             // the audio enhancement was refused, not the burn rule 3 or a remembered pick chose:
             // keep that subtitle
-            if client_draws { 0 } else if burn_for_audio || memory_burn.is_some() { burn_sub_sid } else { env.sub_sid },
-            client_draws,
+            if client_draws || carried_burn_refused { 0 } else if burn_for_audio || memory_burn.is_some() { burn_sub_sid } else { env.sub_sid },
+            client_draws || carried_burn_refused,
             plan.contract,
         );
         decision = client.transcode_decision(off, &sp);

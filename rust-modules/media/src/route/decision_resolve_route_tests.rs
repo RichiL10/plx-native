@@ -2535,6 +2535,8 @@ fn a_cold_start_with_a_subtitle_keeps_a_same_language_or_foreign_non_commentary_
 #[test]
 #[cfg(feature = "devtriggers")]
 fn a_cold_start_with_a_subtitle_and_only_a_commentary_to_stand_in_burns_it() {
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
     let (plan, requests) = cold_audio_resolve(
         "cold-sub-burn",
         4,
@@ -2542,7 +2544,7 @@ fn a_cold_start_with_a_subtitle_and_only_a_commentary_to_stand_in_burns_it() {
         vec![cold_track(1, "truehd", "eng", true, ""), cold_track(2, "ac3", "eng", false, "Commentary")],
         vec![selected_sub(50, "srt")],
         "truehd",
-        |_, _| {},
+        |_, _| set_sub_burn_for_test(Some(true)),
     );
     let tc = requests.iter().find(|l| l.contains("/decision?") && !l.contains("hasMDE=1")).expect("transcode decision");
     assert_eq!(query_param(tc, "subtitleStreamID"), Some("50"), "{tc}");
@@ -2681,4 +2683,26 @@ fn uncopyable_video_keeps_its_stand_in() {
     );
     assert!(plan.url.contains("/library/parts/36013/"), "{}", plan.url);
     assert!(request_with(&requests, "hasMDE=1").iter().all(|l| query_param(l, "audioStreamID") == Some("3")), "{requests:?}");
+}
+
+/// FORK (RichiL10) B4: the commentary stand-in's burn (rule 3) is refused on a 4K source under
+/// `sub_burn=never4k` (the default): the route stays the plain remux, the video is copied and
+/// nothing burns ("Il ritorno del re": eng TrueHD, a commentary beside it, a subtitle selected).
+#[test]
+#[cfg(feature = "devtriggers")]
+fn fork_a_cold_start_commentary_stand_in_on_4k_is_not_burned() {
+    let (plan, requests) = cold_audio_resolve(
+        "fork-cold-no-burn",
+        4,
+        MDE_TRANSCODE_COPY,
+        vec![cold_track(1, "truehd", "eng", true, ""), cold_track(2, "ac3", "eng", false, "Commentary")],
+        vec![selected_sub(50, "srt")],
+        "truehd",
+        |_, _| {},
+    );
+    let tc = requests.iter().find(|l| l.contains("/decision?") && !l.contains("hasMDE=1")).expect("transcode decision");
+    assert!(plan.contract.remux, "{}", plan.url);
+    assert!(request_with(&requests, "subtitles=burn").is_empty(), "{requests:?}");
+    assert!(!tc.contains("maxVideoBitrate") && !tc.contains("videoResolution"), "a copy carries no cap: {tc}");
+    assert_eq!(query_param(tc, "audioStreamID"), Some("1"), "{tc}");
 }

@@ -393,6 +393,17 @@ pub struct PlaybackSession {
     /// Capability and presentation frozen when `stream_dovi` entered this physical route. An
     /// audio switch, reload, Original recovery and rollback all copy this beside the raw record.
     stream_dv_decision: plx_data::metadata::DvDecision,
+    /// FORK (RichiL10): the SOURCE's Dolby Vision layering and the direct-play declaration frozen
+    /// for it at playback start ([`super::plan::Plan::source_dovi`]). Item-level, unlike the two
+    /// `stream_*` fields above: no route change writes them (they are not restored from a route
+    /// projection either), so a route that copies the source HEVC video again after one that did
+    /// not (a burn, HLS, a capped rung) re-declares what direct play would ([`copied_video_dv`]).
+    /// They also say whether this item is a Dolby Vision source at all ([`burn_refused_for_source`]).
+    item_dovi: plx_data::metadata::Dovi,
+    item_dv_decision: plx_data::metadata::DvDecision,
+    /// FORK (RichiL10): the SOURCE's video is HDR (PQ/HLG or Dolby Vision, `PlayingItem::hdr`),
+    /// item-level like `item_dovi`: a burn would re-encode it ([`burn_refused_for_source`]).
+    item_hdr: bool,
     /// **Does the audio elementary stream we are feeding carry Dolby Atmos?** The Load payload's
     /// `contents.immersive` node turns on it ([`crate::player::engine`]).
     ///
@@ -535,6 +546,9 @@ impl PlaybackSession {
         stream_fps: 0.0,
         stream_dovi: plx_data::metadata::Dovi::NONE,
         stream_dv_decision: plx_data::metadata::DvDecision::NONE,
+        item_dovi: plx_data::metadata::Dovi::NONE,
+        item_dv_decision: plx_data::metadata::DvDecision::NONE,
+        item_hdr: false,
         stream_immersive: false,
         title: [0; 128],
         ctxline: [0; 96],
@@ -618,6 +632,9 @@ impl PlaybackSession {
             stream_fps,
             stream_dovi,
             stream_dv_decision,
+            item_dovi,
+            item_dv_decision,
+            item_hdr,
             stream_immersive,
             title,
             ctxline,
@@ -681,6 +698,9 @@ impl PlaybackSession {
             stream_fps: *stream_fps,
             stream_dovi: *stream_dovi,
             stream_dv_decision: *stream_dv_decision,
+            item_dovi: *item_dovi,
+            item_dv_decision: *item_dv_decision,
+            item_hdr: *item_hdr,
             stream_immersive: *stream_immersive,
             title: *title,
             ctxline: *ctxline,
@@ -1001,6 +1021,12 @@ pub(super) struct AppliedRouteProjection {
     stream_dovi: plx_data::metadata::Dovi,
     stream_dv_decision: plx_data::metadata::DvDecision,
     stream_immersive: bool,
+    /// FORK (RichiL10): the item's own DV facts (`Session::item_dovi`), read-only here: copied in
+    /// so a landing that only sees the projection ([`apply_retranscode_outcome_to_projection`])
+    /// can restore them on a video copy, and never written back by [`install_route_projection`],
+    /// because they belong to the item, not to any one route.
+    item_dovi: plx_data::metadata::Dovi,
+    item_dv_decision: plx_data::metadata::DvDecision,
 }
 
 fn route_projection(ps: &PlaybackSession) -> AppliedRouteProjection {
@@ -1024,6 +1050,8 @@ fn route_projection(ps: &PlaybackSession) -> AppliedRouteProjection {
         stream_dovi: s.stream_dovi,
         stream_dv_decision: s.stream_dv_decision,
         stream_immersive: s.stream_immersive,
+        item_dovi: s.item_dovi,
+        item_dv_decision: s.item_dv_decision,
     }
 }
 
@@ -5395,20 +5423,39 @@ pub fn stream_dv_decision(ps: &PlaybackSession) -> plx_data::metadata::DvDecisio
 fn clear_output_dv(session: &mut PlaybackSession) {
     // FORK (RichiL10): PMS may omit the Matroska DOVI configuration record while retaining the
     // HEVC RPU NALs.  The frozen source decision is therefore the only truthful Load declaration.
+    // The item's own facts come first: the route being replaced may be a burn or HLS that had
+    // already dropped them, and this copy carries the source bitstream again.
     if plx_base::forkknobs::is("remux_dv", "on", "on")
         && session.cur_contract.remux
         && session.stream_vcodec.eq_ignore_ascii_case("hevc")
-        && session.stream_dv_decision.presentation.declared().is_some()
     {
-        crate::player::log(&format!(
-            "route: remux keeps Dolby Vision (P{}{}, video copy)",
-            session.stream_dovi.profile,
-            if session.stream_dovi.converts_to_p81() { "->8.1" } else { "" },
-        ));
-        return;
+        if let Some((dovi, decision)) = copied_video_dv(
+            (session.item_dovi, session.item_dv_decision),
+            (session.stream_dovi, session.stream_dv_decision),
+        ) {
+            session.stream_dovi = dovi;
+            session.stream_dv_decision = decision;
+            crate::player::log(&format!(
+                "route: remux keeps Dolby Vision (P{}{}, video copy)",
+                dovi.profile,
+                if dovi.converts_to_p81() { "->8.1" } else { "" },
+            ));
+            return;
+        }
     }
     session.stream_dovi = plx_data::metadata::Dovi::NONE;
     session.stream_dv_decision = plx_data::metadata::DvDecision::NONE;
+}
+
+/// FORK (RichiL10): **the Dolby Vision declaration a route that copies the source HEVC video
+/// carries**: the item's own (`item`, frozen at playback start and never cleared by a route
+/// change), else the one the route being replaced still declared (`current`), else none. The
+/// caller has already established the copy; a re-encode never asks.
+fn copied_video_dv(
+    item: (plx_data::metadata::Dovi, plx_data::metadata::DvDecision),
+    current: (plx_data::metadata::Dovi, plx_data::metadata::DvDecision),
+) -> Option<(plx_data::metadata::Dovi, plx_data::metadata::DvDecision)> {
+    [item, current].into_iter().find(|(_, d)| d.presentation.declared().is_some())
 }
 
 /// Thread-safe frozen Dolby Vision source metadata for the current physical route.  The demuxer
@@ -8491,6 +8538,9 @@ fn apply_plan(ps: &mut PlaybackSession, meta: &mut plx_data::stores::metadata::M
             stream_fps: plan.fps,
             stream_dovi: plan.dovi,
             stream_dv_decision: plan.dv_decision,
+            item_dovi: plan.source_dovi,
+            item_dv_decision: plan.source_dv_decision,
+            item_hdr: plan.source_hdr,
             stream_immersive: plan.immersive,
             title,
             ctxline,
@@ -8769,6 +8819,10 @@ fn retranscode_contract(ps: &PlaybackSession) -> plx_plex::plex::EncodeContract 
         return enhanced_remux_contract(want_live(ps), matches!(route, Some(EnhancementRoute::Burn)));
     }
     if plain_rebuild_is_remux(ps) {
+        // FORK (RichiL10): only the refused burn kept this rebuild a copy (`burn_refused_for_source`).
+        if ps.cur_sub_sid != 0 && !side_subs_allowed(ps) {
+            log_burn_refused();
+        }
         // Not the enhancement's remux (`NONE`, on purpose): the Legacy fallback contract is built
         // before a refusal is known, so carrying the Boost/Normalize params here would repeat the
         // ask the server just refused and reject the track pick itself. Wanted-and-offered
@@ -8807,12 +8861,81 @@ fn re_encode_contract(
 /// to the remux. `cur_sub_sid == 0` is required: every transcode rebuild with a subtitle sends
 /// `subtitles=burn`, which the remux shape does not honour.
 ///
+/// FORK (RichiL10): except where the fork refuses the burn ([`burn_refused_for_source`]: a 4K or
+/// Dolby Vision source). There the rebuild stays the copy and the subtitle is withheld, so neither
+/// a seek nor a track pick can turn the video copy into the real-time 4K re-encode it cannot run.
+///
 /// Not a loop: the automatic Original -> HLS fallback writes a ceiling and `FixedHls` into the
 /// contract before it rebuilds, a fixed rung fails `enhancement_quality`, and a refused remux is
 /// rejected with the current stream retained rather than retried.
 fn plain_rebuild_is_remux(ps: &PlaybackSession) -> bool {
-    (original_remux_shape(ps) || fork_copy_stays_copy(ps))
-        && (ps.cur_sub_sid == 0 || side_subs_allowed(ps))
+    copy_shape(ps) && (ps.cur_sub_sid == 0 || side_subs_allowed(ps) || burn_refused_for_source(ps))
+}
+
+/// [`plain_rebuild_is_remux`]'s shape half: the Original remux's shape, or the fork's video copy.
+fn copy_shape(ps: &PlaybackSession) -> bool {
+    original_remux_shape(ps) || fork_copy_stays_copy(ps)
+}
+
+/// FORK (RichiL10): the knob `sub_burn` (`never4k` default, `allow` = upstream's burn). Host tests
+/// set it through [`set_sub_burn_for_test`] instead of the shared conf file.
+fn sub_burn_allowed() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(allow) = SUB_BURN_FOR_TEST.with(std::cell::Cell::get) {
+        return allow;
+    }
+    plx_base::forkknobs::is("sub_burn", "allow", "never4k")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SUB_BURN_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam for the `sub_burn` knob on this thread: `Some(true)` = `allow`, `Some(false)` =
+/// `never4k`, `None` = read the conf file.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_sub_burn_for_test(allow: Option<bool>) {
+    SUB_BURN_FOR_TEST.with(|c| c.set(allow));
+}
+
+/// FORK (RichiL10): **does the fork refuse to have the server burn a subtitle into this source?**
+/// A 4K source (wider than 1920), a Dolby Vision one or an HDR one, unless `sub_burn=allow`.
+/// Burning means a full video re-encode, which the household server cannot do in real time at 4K
+/// (playback stalls) and which loses the Dolby Vision and the HDR either way. A route that copies
+/// the video then keeps copying it and the subtitle is not shown ([`SubtitlePresenter::Withheld`]).
+fn burn_refused_for_source(ps: &PlaybackSession) -> bool {
+    burn_refused_for_item(ps.cur_src.1, ps.item_dovi.present, ps.item_hdr)
+}
+
+/// [`burn_refused_for_source`] from the source's facts as plain values, so the cold start
+/// (`plan::build_stream`, which has no session yet) asks the same question.
+pub(super) fn burn_refused_for_item(width: i64, dovi_present: bool, hdr: bool) -> bool {
+    (width > 1920 || dovi_present || hdr) && !sub_burn_allowed()
+}
+
+/// FORK (RichiL10): **is the selected subtitle withheld** — selected, on a transcode that copies the
+/// video, not drawable by the app over it, and refused a burn by [`burn_refused_for_source`]? Then
+/// nothing draws it: not the server, not the app.
+fn burn_withheld(ps: &PlaybackSession) -> bool {
+    burn_withheld_for(ps, ps.cur_sub_sid, ps.cur_sub_client_drawable, ps.cur_sub_sidecar)
+}
+
+/// [`burn_withheld`] for a prospective pick, before it is written (see [`side_subs_allowed_for`]).
+fn burn_withheld_for(ps: &PlaybackSession, sid: i64, drawable: bool, sidecar: bool) -> bool {
+    sid != 0
+        && is_transcoding(ps)
+        && ps.cur_contract.remux
+        && copy_shape(ps)
+        && !side_subs_allowed_for(ps, sid, drawable, sidecar)
+        && burn_refused_for_source(ps)
+}
+
+/// FORK (RichiL10): the one line every burn refusal logs, mid-play and at the cold start.
+pub(super) fn log_burn_refused() {
+    crate::player::log(
+        "subtitles: burn refused for a 4K/Dolby Vision source; keeping the video copy (subtitle not shown)",
+    );
 }
 
 /// FORK (RichiL10): **a route that copies the source video keeps copying it.** Direct play or a
@@ -9222,17 +9345,28 @@ pub(super) fn apply_retranscode_outcome_to_projection(p: &mut AppliedRouteProjec
     p.stream_fps = 0.0;
     // FORK (RichiL10): an audio pick or a seek on a route whose server COPIES the HEVC video
     // keeps the source's Dolby Vision declaration (direct play's, or the remux's own): the
-    // bitstream, RPUs included, is the same one. Any re-encode clears it as before.
-    let keeps_dv = plx_base::forkknobs::is("remux_dv", "on", "on")
+    // bitstream, RPUs included, is the same one. The item's own facts come first, so a copy that
+    // follows a burn or an HLS rung (which dropped them) declares them again. Any re-encode
+    // clears it as before.
+    let copies_video = plx_base::forkknobs::is("remux_dv", "on", "on")
         && applied.contract.remux
         && applied.video_copied
-        && applied.vcodec.eq_ignore_ascii_case("hevc")
-        && p.stream_dv_decision.presentation.declared().is_some();
-    if keeps_dv {
+        && applied.vcodec.eq_ignore_ascii_case("hevc");
+    let carried = copies_video
+        .then(|| {
+            copied_video_dv(
+                (p.item_dovi, p.item_dv_decision),
+                (p.stream_dovi, p.stream_dv_decision),
+            )
+        })
+        .flatten();
+    if let Some((dovi, decision)) = carried {
+        p.stream_dovi = dovi;
+        p.stream_dv_decision = decision;
         crate::player::log(&format!(
             "route: rebuilt remux keeps Dolby Vision (P{}{}, video copy)",
-            p.stream_dovi.profile,
-            if p.stream_dovi.converts_to_p81() { "->8.1" } else { "" },
+            dovi.profile,
+            if dovi.converts_to_p81() { "->8.1" } else { "" },
         ));
     } else {
         p.stream_dovi = plx_data::metadata::Dovi::NONE;
@@ -9377,6 +9511,9 @@ fn subtitle_effect_of(ps: &PlaybackSession) -> SubtitleEffect {
         0 => SubtitleEffect::None,
         // A sidecar the app cannot draw (an image .sup/.idx) is a burn, never "unaffected".
         _ if sidecar_drawn_by_client(ps) || side_subs_allowed(ps) => SubtitleEffect::Sidecar,
+        // FORK (RichiL10): a withheld subtitle is on screen nowhere, so nothing about the route
+        // has to carry it (and no enhancement may burn it either).
+        _ if burn_withheld(ps) => SubtitleEffect::None,
         _ => SubtitleEffect::Embedded,
     }
 }
@@ -9402,6 +9539,10 @@ pub enum SubtitlePresenter {
     ClientOverRemux,
     /// The server burns it into the picture: nothing the app has can reach it.
     ServerBurn(BurnReason),
+    /// FORK (RichiL10): selected but NOT on screen. The route copies a 4K or Dolby Vision video,
+    /// the app cannot draw this track over it, and the fork refuses the burn that would replace
+    /// the copy with a real-time 4K re-encode (`sub_burn=never4k`). Nothing draws it.
+    Withheld,
 }
 
 impl SubtitlePresenter {
@@ -9438,6 +9579,9 @@ pub fn subtitle_presenter(ps: &PlaybackSession) -> SubtitlePresenter {
         && side_subs_allowed(ps)
     {
         SubtitlePresenter::ClientOverRemux
+    } else if burn_withheld(ps) {
+        // FORK (RichiL10): no burn claim for a subtitle nobody draws.
+        SubtitlePresenter::Withheld
     } else if enhancement_family(ps) == RouteFamily::Remux {
         SubtitlePresenter::ServerBurn(BurnReason::AudioConversion)
     } else {
@@ -9447,7 +9591,9 @@ pub fn subtitle_presenter(ps: &PlaybackSession) -> SubtitlePresenter {
 
 /// **Does the server burn the selected subtitle into the picture?** The gate every client-side
 /// draw is silenced by: a transcode burns whatever is selected, except a remux the app draws the
-/// subtitle over ([`SubtitlePresenter::ClientOverRemux`]).
+/// subtitle over ([`SubtitlePresenter::ClientOverRemux`]). FORK (RichiL10): a
+/// [`SubtitlePresenter::Withheld`] subtitle answers `true` too: nothing is burned, but nothing may
+/// be drawn either.
 pub fn subtitles_burned(ps: &PlaybackSession) -> bool {
     is_transcoding(ps)
         && subtitle_presenter(ps) != SubtitlePresenter::ClientOverRemux
@@ -9480,9 +9626,17 @@ pub fn side_subtitles_failed(ps: &mut PlaybackSession) {
     {
         return;
     }
-    crate::player::log("subtitles: the side reader failed; the server burns the subtitle");
     let _edit = begin_user_contract_boundary();
     ps.side_subs_refused = true;
+    // FORK (RichiL10): with the burn refused for this source the stream has nothing to change:
+    // the copy stays, the subtitle is withheld, and only the projection records it.
+    if burn_withheld(ps) {
+        crate::player::log("subtitles: the side reader failed");
+        log_burn_refused();
+        commit_in_place_route_projection(ps, false);
+        return;
+    }
+    crate::player::log("subtitles: the side reader failed; the server burns the subtitle");
     if reconcile_enhancement(ps, true) {
         return;
     }
@@ -10534,12 +10688,20 @@ fn commit_audio_route(ps: &mut PlaybackSession, audio: CarriedAudio, may_release
 /// the pick's ordinary reload rather than being overtaken by the recovery (the merge lets a
 /// `RecoverOriginal` replace whatever is pending).
 fn fork_pick_releases_remux(ps: &PlaybackSession, direct_plays: bool) -> bool {
+    live_family(ps) == RouteFamily::Remux && !ps.cur_contract.audio.any() && fork_release_open(ps, direct_plays)
+}
+
+/// FORK (RichiL10): the conditions a fork release shares, whatever the pick: a carried track the TV
+/// decodes (`direct_plays`), Auto/Original quality desired and applied, a live transcode, no
+/// enhancement wanted, an Original candidate that feeds the Part, and nothing else queued.
+fn fork_release_open(ps: &PlaybackSession, direct_plays: bool) -> bool {
     direct_plays
         && enhancement_quality()
         && matches!(applied_quality(), Quality::Auto | Quality::Original)
         && is_transcoding(ps)
-        && live_family(ps) == RouteFamily::Remux
-        && !ps.cur_contract.audio.any()
+        && !ps.preview
+        // An Original trial already owns the reducer; a recovery planned now is refused anyway.
+        && !original_recovery_pending()
         && !want_live(ps).any()
         && ps.auto_original.as_ref().is_some_and(|c| c.feeds_part())
         && PLAYER_CONTROL.lock().unwrap_or_else(|e| e.into_inner()).pending_user.is_none()
@@ -10598,6 +10760,12 @@ fn commit_subtitle_selection_inner(
         ctx.rematch = None;
     }
     let transcoding = is_transcoding(ps);
+    // FORK (RichiL10): an embedded pick the app cannot draw over a 4K or Dolby Vision video copy is
+    // never burned (`sub_burn=never4k`): the copy stays exactly as it is and the pick is withheld,
+    // committed in place like a pick the app draws. Read from the pick itself, before it is written.
+    let withheld = transcoding
+        && live_family(ps) == RouteFamily::Remux
+        && burn_withheld_for(ps, stream_id, client_renderable, sub_idx < 0);
     // A live plain remux whose new pick is Off or a subtitle the app draws over it (a sidecar, or
     // an embedded track the side reader is admitted for) keeps its stream: the server never carried
     // the subtitle, so nothing about the encode changes; only the side reader follows the pick
@@ -10607,7 +10775,12 @@ fn commit_subtitle_selection_inner(
     let in_place = transcoding
         && live_family(ps) == RouteFamily::Remux
         && (stream_id == 0
-            || side_subs_allowed_for(ps, stream_id, client_renderable, sub_idx < 0));
+            || side_subs_allowed_for(ps, stream_id, client_renderable, sub_idx < 0)
+            || withheld);
+    // FORK (RichiL10): may this pick send the live route back to the file? Only a plain remux or a
+    // plain Original-quality burn qualifies, and the burn reads the subtitle on screen BEFORE the
+    // pick, so this is captured before `set_subtitle` below (see `fork_subtitle_pick_releases`).
+    let releasable = fork_route_releasable_by_subtitle(ps);
     // Burned subtitles are part of the server/decoder contract, so revoke old worker evidence
     // before changing them. A direct-play subtitle is client-rendered and needs no reload; fencing
     // there would kill the valid Original watchdog while leaving the physical route untouched.
@@ -10688,6 +10861,24 @@ fn commit_subtitle_selection_inner(
     if reconcile_enhancement(ps, transcoding && !in_place) {
         return;
     }
+    // FORK (RichiL10): the build-3 audio release, for a subtitle pick. With the selected audio one
+    // the TV decodes, the remux (or burn) is only standing for the subtitle, and direct play draws
+    // every subtitle the candidate carries (`retarget_subtitle` above kept it only if the app can
+    // draw it). One `RecoverOriginal(EnhancementReleased)` claim; a refusal owes what this pick
+    // owed without it: a rebuild (`ClaimFallback::Legacy`) when the pick was not applied in place,
+    // otherwise nothing, the in-place commit already being the applied route.
+    if releasable && fork_subtitle_pick_releases(ps) {
+        crate::player::log("route: subtitle pick direct-plays - releasing the remux back to the original file");
+        queue_user_route_intent(
+            ps,
+            UserRouteIntent::RecoverOriginal(RecoveryCause::EnhancementReleased),
+            !in_place,
+        );
+        return;
+    }
+    if withheld {
+        log_burn_refused();
+    }
     if transcoding && !in_place {
         crate::player::request_transcode_refresh(ps); // retranscode PUTs the selection itself
     }
@@ -10717,6 +10908,27 @@ pub fn forced_only_lang(ps: &PlaybackSession) -> &str {
 #[cfg(any(test, feature = "test-support"))]
 pub fn set_forced_only_lang_for_test(ps: &mut PlaybackSession, lang: &str) {
     ps.track_ctx.get_or_insert_with(TrackContext::default).forced_lang = lang.to_string();
+}
+
+/// FORK (RichiL10): **is the live route one a subtitle pick may release** — a plain progressive-MKV
+/// remux, or a plain Original-quality burn (no enhancement params on either)? Read BEFORE the pick
+/// is written: `live_is_original_burn` reads the subtitle on screen, which the pick changes.
+fn fork_route_releasable_by_subtitle(ps: &PlaybackSession) -> bool {
+    is_transcoding(ps)
+        && !ps.cur_contract.audio.any()
+        && (live_family(ps) == RouteFamily::Remux || live_is_original_burn(ps))
+}
+
+/// FORK (RichiL10): **does this subtitle pick release the route back to the file?** The audio
+/// release's own conditions ([`fork_release_open`]) for the audio already selected: it must be a
+/// track the TV decodes, known (`cur_audio`), and the candidate, retargeted to the pick, must still
+/// feed the Part. Asked only by [`commit_subtitle_selection`], after the pick is written.
+fn fork_subtitle_pick_releases(ps: &PlaybackSession) -> bool {
+    let direct_plays = ps
+        .cur_audio
+        .as_ref()
+        .is_some_and(|a| carried_audio_direct_plays(ps, a));
+    fork_release_open(ps, direct_plays)
 }
 
 /// Atomically publish the main-thread session fields a newly spawned timeline reporter may read.

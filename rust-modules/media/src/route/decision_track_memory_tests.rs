@@ -744,7 +744,12 @@ fn q_top_b_the_commentary_stand_in_burn_carries_the_remembered_subtitle() {
     case.audio = vec![truehd, commentary];
     case.mde = MDE_TRANSCODE;
     case.extra = 2; // the selection PUT, and the MDE beside the transcode decision
-    let (plan, requests, _) = resolve_logged(case);
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
+    let (plan, requests, _) = resolve_in(&mut ps, case, |_, plan| plan);
     assert!(plan.url.contains("start.mkv"), "setup: an encode: {}", plan.url);
     assert_eq!(plan.audio.as_ref().map(|a| a.sid), Some(1), "setup: the track asked for is converted");
     assert_burned(&plan, &requests, 55001);
