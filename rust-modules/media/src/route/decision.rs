@@ -10749,7 +10749,14 @@ pub fn commit_subtitle_selection(
     stream_id: i64,
     client_renderable: bool,
 ) {
+    // FORK (RichiL10): read before the commit writes the pick: an Off -> image pick in direct play
+    // re-reads from the playhead so its first cue is not lost to the read-ahead (`sub_reseek`).
+    let prev_sub_idx = crate::player::desired_sub_idx();
+    let direct = !is_transcoding(ps);
     commit_subtitle_selection_inner(ps, sub_idx, stream_id, client_renderable, true);
+    if stream_id != 0 {
+        crate::player::reseek_for_image_subtitle(prev_sub_idx, sub_idx, direct);
+    }
 }
 
 /// [`commit_subtitle_selection`] with the direct-play selection PUT optional. `put == false` is for

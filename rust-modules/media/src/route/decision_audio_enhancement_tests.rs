@@ -1667,6 +1667,54 @@ fn fork_an_embedded_subtitle_pick_on_the_remux_releases_to_the_file() {
     cleanup(&mut ps);
 }
 
+/// FORK (RichiL10) `sub_reseek`: an Off -> image pick on the remux never re-reads from the playhead:
+/// the server's stream is not the app's to re-read (here the pick releases to the file, whose
+/// fresh demux starts with the subtitle on).
+#[test]
+fn fork_an_image_pick_on_the_remux_does_not_reread() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    install(&mut ps, &live, Delivery::Remux(NONE), a1(), Some(candidate(true, a1(), None)), 0);
+    make_4k_dv_source(&mut ps);
+    let arranged = crate::player::sub_reseek_tests::Arranged::playing(736_000_000_000, 12_000_000_000, 0b100);
+    plx_base::forkknobs::with_conf_for_test(None, || commit_subtitle_selection(&mut ps, 2, 77, true));
+    assert_eq!(arranged.seeks(), 0, "a remux pick asks for no seek");
+    drop(arranged);
+    let _ = live.finish();
+    cleanup(&mut ps);
+}
+
+/// FORK (RichiL10) `sub_reseek`: in direct play the viewer's commit drives the re-read: Off ->
+/// image re-reads once from the playhead; Off -> text, a sidecar and Off itself do not.
+#[test]
+fn fork_a_direct_play_off_to_image_pick_rereads_once() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    apply_plan(
+        &mut ps,
+        Plan { url: "http://fixture.invalid/reseek.mkv".into(), ..Default::default() },
+        "rk-reseek",
+    );
+    assert!(!is_transcoding(&ps), "fixture: direct play");
+    let arranged = crate::player::sub_reseek_tests::Arranged::playing(736_000_000_000, 12_000_000_000, 0b110);
+    plx_base::forkknobs::with_conf_for_test(None, || {
+        commit_subtitle_selection(&mut ps, 0, 76, true);
+        assert_eq!(arranged.seeks(), 0, "Off -> text: text is decoded while Off");
+        commit_subtitle_selection(&mut ps, -1, 0, false);
+        commit_subtitle_selection(&mut ps, -1, 55, true);
+        assert_eq!(arranged.seeks(), 0, "a sidecar is not demuxed");
+        commit_subtitle_selection(&mut ps, -1, 0, false);
+        commit_subtitle_selection(&mut ps, 1, 77, true);
+        assert_eq!(arranged.seeks(), 1, "Off -> image re-reads");
+        assert_eq!(crate::player::seek_pending(), 736_000_000_000, "from the playhead");
+        commit_subtitle_selection(&mut ps, 2, 78, true);
+        assert_eq!(arranged.seeks(), 1, "image -> image while on: no second re-read");
+    });
+    drop(arranged);
+    reset_session(&mut ps);
+}
+
 /// FORK (RichiL10) D2 fallback: a release refused at claim time leaves the in-place pick standing,
 /// which on a 4K DV source is the kept video copy with the subtitle withheld (D3), never a burn.
 #[test]

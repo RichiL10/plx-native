@@ -24,6 +24,7 @@
 //! | `remux_dv`     | `on`, `off`                   | route: a server remux that copies the HEVC video declares the source's Dolby Vision as direct play does (`off` = declare nothing) |
 //! | `encode_audio` | `auto`, `ac3`, `eac3`         | route: what the server encodes a track the TV cannot take into, off an optical output (`auto` = E-AC3 then AC3); optical is always AC3, and so is an output the TV did not report unless this says `eac3` |
 //! | `sub_burn`     | `never4k`, `allow`            | route: never have the server burn a subtitle into a source wider than 1920 or with Dolby Vision/HDR (`allow` = upstream's burn) |
+//! | `sub_reseek`   | `on`, `off`                   | player: an image subtitle (PGS/VobSub/DVB) picked from Off in direct play re-reads from the playhead so its first cue shows at once (`off` = wait for the read-ahead to play out) |
 //!
 //! The file is re-read when its modification time changes, at most once per second, so a change
 //! takes effect on the next playback without restarting the app.

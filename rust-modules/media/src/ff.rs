@@ -8860,6 +8860,9 @@ pub fn demux(
                     begin_ass_sources(&url, fmt, streams, sub_tracks.entries())
                 };
                 sub_tracks.log_tracks();
+                // FORK (RichiL10): which tracks are image kinds, for the Off -> image re-read
+                // (`player::reseek_for_image_subtitle`). Empty under a side reader: mask 0.
+                crate::player::publish_image_sub_tracks(sub_tracks.image_mask());
 
                 // Hand-roll length-prefix -> Annex-B + prepend VPS/SPS/PPS at every keyframe (the
                 // format Starfish decodes). FFmpeg's hevc_mp4toannexb does NOT reliably prepend the

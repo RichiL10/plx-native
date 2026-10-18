@@ -388,6 +388,11 @@ impl SubTracks {
         &self.streams
     }
 
+    /// FORK (RichiL10): bit N set = track N is an image kind (`player::image_sub_mask`).
+    pub(super) fn image_mask(&self) -> u64 {
+        crate::player::image_sub_mask(self.streams.iter().map(|(_, k, _)| *k == SubKind::Bitmap))
+    }
+
     /// The track position of ffmpeg stream `stream_index`, if it is a subtitle stream.
     pub(super) fn position(&self, stream_index: c_int) -> Option<usize> {
         self.streams.iter().position(|(sidx, _, _)| *sidx == stream_index)

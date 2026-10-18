@@ -45,6 +45,10 @@ pub mod report;
 mod foreground_flight_tests;
 #[cfg(all(test, feature = "hostsim"))]
 mod resume_tests;
+// FORK (RichiL10): the Off -> image-track re-read (`reseek_for_image_subtitle`); crate-visible so
+// the route's wiring test reuses its arrangement of the player globals.
+#[cfg(test)]
+pub(crate) mod sub_reseek_tests;
 mod shared;
 pub mod sidecar;
 pub mod sub_charset; // legacy-encoding text subtitles (GBK, Big5, Shift_JIS, ...) read as UTF-8; decided once per track
@@ -1777,6 +1781,125 @@ pub fn request_subtitle(idx: i32) {
         SHARED.sub_bitmaps.lock().unwrap().clear();
     }
 }
+
+// FORK (RichiL10): image subtitles turned on mid-play show at once (`sub_reseek`).
+//
+// While subtitles are Off the demuxer skips every image packet (`ff_subs::SubTracks::decode`), and
+// the fork's 96 MiB video queue (`engine::AQ_VIDEO_BYTES`) holds far more read-ahead than the
+// ~2 s upstream sized for: about 12 s at 66 Mbit/s, minutes at low rates. The demuxer never re-reads
+// what it has read, so an image track picked from Off showed its first cue only once that buffered
+// stretch had played out (measured on the TV: about 30 s on a 66 Mbit/s PGS film). An Off -> image
+// pick in direct play therefore re-reads once from the playhead, through the ordinary direct-play
+// seek, so the demux restarts there with image decoding on.
+
+/// The image subtitle tracks of the main demuxer's open file, bit N = track N (the
+/// `desired_sub_idx` ordinal) is an image kind. Published by `ff::demux` after it enumerates the
+/// tracks; 0 while a side reader owns the subtitles (the main demuxer then enumerates none).
+static IMAGE_SUB_TRACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The read-ahead (demuxed video beyond the playhead) above which an Off -> image pick re-reads.
+/// Below it upstream's own read-ahead is short enough for the first cue to arrive in time.
+pub const SUB_RESEEK_MIN_READ_AHEAD_MS: i64 = 3_000;
+
+/// Publish the image-track mask of the file the main demuxer just opened (`ff::demux`).
+pub(crate) fn publish_image_sub_tracks(mask: u64) {
+    IMAGE_SUB_TRACKS.store(mask, Relaxed);
+}
+
+/// The mask of `kinds` (true = image kind), in track order; a track past bit 63 is not marked, so
+/// it never re-reads.
+pub(crate) fn image_sub_mask(kinds: impl IntoIterator<Item = bool>) -> u64 {
+    kinds
+        .into_iter()
+        .take(64)
+        .enumerate()
+        .fold(0, |m, (i, image)| if image { m | (1u64 << i) } else { m })
+}
+
+/// Is subtitle track `idx` an image kind in the open file?
+fn is_image_sub_track(idx: i32, mask: u64) -> bool {
+    (0..64).contains(&idx) && mask & (1u64 << idx) != 0
+}
+
+/// What [`reseek_for_image_subtitle`] decides from, sampled once.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubReseekFacts {
+    /// `sub_reseek` is not `off`.
+    pub knob_on: bool,
+    /// The app demuxes the file itself: direct play, no transcode or remux.
+    pub direct: bool,
+    /// A side reader draws this playback's subtitles (`player::subside`).
+    pub side_reader: bool,
+    /// The selection before the pick (-1 = Off).
+    pub prev_idx: i32,
+    /// The pick (-1 = Off; a sidecar is negative too).
+    pub new_idx: i32,
+    /// The image-track mask of the open file ([`IMAGE_SUB_TRACKS`]).
+    pub image_mask: u64,
+    /// Demuxed video beyond the playhead, `None` before the first post-open/post-seek packet.
+    pub read_ahead_ms: Option<i64>,
+    /// This session has presented a picture (not the cold start).
+    pub seen_frame: bool,
+    /// A seek is already requested or resolving: it restarts the demux anyway.
+    pub seeking: bool,
+}
+
+/// **Does this pick re-read from the playhead?** Only an Off -> image-track pick, in direct play,
+/// mid-play, with more read-ahead than [`SUB_RESEEK_MIN_READ_AHEAD_MS`]. Never for a text track
+/// (always decoded), an image -> image switch (every image track is decoded while on), the cold
+/// start, a remux/transcode, or the side reader. Pure.
+pub(crate) fn sub_reseek_due(f: &SubReseekFacts) -> bool {
+    f.knob_on
+        && f.direct
+        && !f.side_reader
+        && f.prev_idx < 0
+        && f.new_idx >= 0
+        && is_image_sub_track(f.new_idx, f.image_mask)
+        && f.seen_frame
+        && !f.seeking
+        && f.read_ahead_ms.is_some_and(|ms| ms > SUB_RESEEK_MIN_READ_AHEAD_MS)
+}
+
+/// Demuxed video beyond the playhead, in ms (the diagnostics' reserve on the video lane alone: the
+/// subtitle packets are interleaved with the video the demuxer reads).
+fn demux_read_ahead_ms() -> Option<i64> {
+    playable_buffer_ms(
+        SHARED.hls_video_tail_ns.load(Relaxed),
+        -1,
+        false,
+        SHARED.disp_base.load(Relaxed),
+        SHARED.playpos_ns.load(Relaxed),
+    )
+}
+
+/// Called by the viewer's subtitle commit (`route::commit_subtitle_selection`) with the selection
+/// before it (`prev_idx`), the pick (`new_idx`) and whether the route is direct play. When
+/// [`sub_reseek_due`] holds, requests the direct-play seek to the playhead (a native seek may land
+/// on the keyframe before it: a second repeats, nothing is skipped). Returns whether it did.
+pub fn reseek_for_image_subtitle(prev_idx: i32, new_idx: i32, direct: bool) -> bool {
+    let read_ahead_ms = demux_read_ahead_ms();
+    let facts = SubReseekFacts {
+        knob_on: !plx_base::forkknobs::is("sub_reseek", "off", "on"),
+        direct,
+        side_reader: SHARED.side_subs_owner.load(Relaxed),
+        prev_idx,
+        new_idx,
+        image_mask: IMAGE_SUB_TRACKS.load(Relaxed),
+        read_ahead_ms,
+        seen_frame: SHARED.seen_frame.load(Relaxed),
+        seeking: SHARED.seeking.load(Relaxed) || TX.seek_to_ns.load(Relaxed) >= 0,
+    };
+    if !sub_reseek_due(&facts) {
+        return false;
+    }
+    log(&format!(
+        "subtitles: image track turned on mid-play - re-reading from the playhead (read-ahead {} ms)",
+        read_ahead_ms.unwrap_or(0)
+    ));
+    request_seek(SHARED.playpos_ns.load(Relaxed).max(0));
+    true
+}
+
 /// The tone client-rendered subtitles are drawn in. A [`crate::route::LiveCell`] rather than a field
 /// of [`SHARED`] because it OUTLIVES a playback — it is a preference, not session state
 /// (the same reasoning as the quality cell in `route::prefs`) — and `reset_session` must not put a viewer back on white
