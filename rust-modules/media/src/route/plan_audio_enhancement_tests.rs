@@ -152,6 +152,9 @@ fn enhanced_remux_plan_carries_the_source_rate_and_a_burn_does_not() {
     assert_eq!(r.plan.src_fps, 23.976);
     plx_plex::plex::reset_servers_for_test();
 
+    // FORK (RichiL10): a 4K fixture, which the fork never burns into by default (`sub_burn=never4k`,
+    // `decision::burn_refused_for_source`); this pins upstream's burn under `sub_burn=allow`.
+    set_sub_burn_for_test(Some(true));
     let r = resolve(&mut ps, MDE_DIRECTPLAY, EnhMode::Honor("ac3"), 0, MKV, "ac3",
         |sid| fourk_item_with_subs(sid, vec![track(1, "ac3", 2, true)], vec![selected_sub(9, "srt")]),
         |_, _| {});
@@ -1033,8 +1036,8 @@ fn le_due_torri_episode(sid: ServerId) -> plx_data::metadata::PlayingItem {
 
 /// B2 + B4 at the cold start: a remembered per-series subtitle on a 4K DV film whose audio only the
 /// server converts. The remux copies the video and declares the source's Dolby Vision (P7, fed as
-/// 8.1) exactly as direct play would, and nothing is burned, with the audio enhancement off and
-/// with it on (upstream's forced burn, refused under `sub_burn=never4k`).
+/// 8.1) and frame rate exactly as direct play would, and nothing is burned, with the audio
+/// enhancement off and with it on (upstream's forced burn, refused under `sub_burn=never4k`).
 #[test]
 #[cfg(feature = "devtriggers")]
 fn fork_cold_start_remembered_subtitle_on_a_4k_dv_film_keeps_dv_and_burns_nothing() {
@@ -1055,6 +1058,7 @@ fn fork_cold_start_remembered_subtitle_on_a_4k_dv_film_keeps_dv_and_burns_nothin
         }
         assert!(!r.plan.url.contains("subtitles=burn"), "{enh:?}: {}", r.plan.url);
         assert!(r.plan.dv_decision.presentation.declared().is_some(), "{enh:?}: the copy declares DV");
+        assert_eq!(r.plan.fps, 23.976, "{enh:?}: the copy declares the film's own rate (#832)");
         assert_eq!(r.plan.dovi.profile, 7, "{enh:?}");
         assert!(r.plan.source_dovi.converts_to_p81() && r.plan.source_hdr, "{enh:?}: the item's facts");
         plx_plex::plex::reset_servers_for_test();
