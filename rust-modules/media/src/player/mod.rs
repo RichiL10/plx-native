@@ -1811,9 +1811,8 @@ pub(crate) fn publish_image_sub_tracks(mask: u64) {
 pub(crate) fn image_sub_mask(kinds: impl IntoIterator<Item = bool>) -> u64 {
     kinds
         .into_iter()
-        .take(64)
         .enumerate()
-        .fold(0, |m, (i, image)| if image { m | (1u64 << i) } else { m })
+        .fold(0, |m, (i, image)| if image && i < 64 { m | (1u64 << i) } else { m })
 }
 
 /// Is subtitle track `idx` an image kind in the open file?
