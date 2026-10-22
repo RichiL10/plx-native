@@ -36,14 +36,26 @@ Build trees are per-checkout and large. `make disk` reports what this machine is
 rebuild. Run `tools/build-gc.sh --orphans` after tearing down a set of worktrees: lane target
 directories live outside the repo and outlive the worktree that made them. `--worktrees` is
 different in kind, not degree: it removes FINISHED lane checkouts themselves (clean, unlocked,
-already on `main`) — not just their build output — so it is not part of `--all`.
+already on `origin/main`) — not just their build output — so it is not part of `--all`. A removed
+checkout takes its gitignored files with it (a `src/config.local.h`, a `pkg/auth.json`, a lane's notes):
+by hand `-n` lists the ones that are not build output, and unattended (`--auto`) a lane holding any is kept.
 
-None of the above has to be run by hand: `tools/build-gc.sh --auto` stages the same reclaim on its
-own, gated by free space on the volume (`PLX_GC_MIN_FREE_GIB`, default 20) and, for `--lanes`, by
-a lane idle guard (`PLX_GC_IDLE_MIN`, default 60) so a lane an agent might resume soon is spared.
+None of the above has to be run by hand: `tools/build-gc.sh --auto` reclaims on its own, gated by
+free space on the volume (`PLX_GC_MIN_FREE_GIB`, default 20) and by a lane idle guard
+(`PLX_GC_IDLE_MIN`, default 60) so a lane an agent might resume soon is spared. After `--orphans`
+and `--worktrees` (which keeps a lane that holds private ignored files) it follows the order `tools/disk-budget.py` plans (`docs/disk-budget.md`): garbage
+first, then other lanes' incremental caches, then idle lanes' trees, and the main checkout's
+incremental cache only as the last resort. The cargo seed is never evicted by it.
 It runs from a Claude Code `SessionEnd` hook and from the hourly launchd agent `make disk-watch`
 installs (`tools/install-disk-watch.sh`, macOS only — run it yourself; nothing here installs it
 for you). Logs land in `~/Library/Logs/plxnative-build-gc.log` (or `$PLX_GC_LOG`).
+
+A build also checks the budget when it starts: every cargo-running `make` target runs
+`make disk-preflight` first (`make -s print-disk-entries` lists them). With room it costs one
+`statvfs`; below the comfort line it evicts idle trees through the same planner, never the tree it
+is building (and the current checkout's other trees only lose their incremental dirs, and only when
+nothing cheaper covers the build), and it refuses only when everything it may take still cannot
+cover the build plus a 3 GiB reserve. `PLX_MIN_FREE_MB=0` skips it.
 
 The bundled FFmpeg is not rebuilt per checkout. Its source and object tree is machine-wide under
 `$PLX_BUILD_CACHE` (default `~/.cache/plxnative`), keyed by configure flags and toolchain, so a

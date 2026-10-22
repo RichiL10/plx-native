@@ -137,6 +137,14 @@ spec's "Media Queries" section documents the full query language.
   tag id, while its `guid` is shared with search hits and member `Collection[]` tags. Adding
   `includeCollections=1` to `/hubs/search` yields full collection `Metadata[]` rows rather than
   tag-shaped `Directory[]` hits.
+- **Collections count (the Library header's "Collections · N"):** `GET
+  /library/sections/{key}/all?type=18` with `X-Plex-Container-Start=0` and `X-Plex-Container-Size=0`
+  returns no rows and the section's collection count as `totalSize` (the same count the
+  `/collections` listing and `firstCharacter?type=18` total to). The client reads three answers apart:
+  a number (a real `0` included), a refusal (401/403 — an unshared section, as the listing above),
+  and unknown (404, transport failure, malformed body). Collection rows also carry `subtype` (`movie`, `show`, …), `smart`
+  (`"1"` for a smart collection — a saved filter whose `childCount` is its current match count, not a
+  hand-picked set), `childCount` and `addedAt`; a show row's `childCount` is its season count.
 - **Collection routes and hubs:** `/library/collections/{rk}/children` and `/items` return the same
   paged members. A promoted `custom.collection.*` hub embeds the members and carries the collection
   ratingKey in its identifier; a member's `collection.related.*` hub lists the whole collection.
@@ -216,7 +224,14 @@ the spec but **this server does not emit it on `Role[]`** — treat 0 as unknown
   `/tmp/plxnative-personbio` exists for one step further along — the biography degrades to a blank
   line, the filmography to nothing at all — and it is why `/tmp/plxnative-personcredits` had to be
   written. Reaching either with real data needs a signed-in account (`make sim` with a real
-  session, or the debug install with `--no-token`).
+  session, or the debug install with `--no-token`). A `devtriggers` build does not even ask on such
+  a boot, by decision (fail closed; the cost is accepted): with no Discover stand-in armed
+  (`plxnative-discover`, or a `plxnative-plextv` redirect that Discover follows) the person store
+  settles both reads as an empty answer without spawning a worker, `AccountClient::person_profile` /
+  `person_credits` refuse the same read if anything else calls them, and `discover: GET … refused` is
+  logged once. Such a boot shows no biography and no filmography credits; with a stand-in armed,
+  `tests/mock_pms.py` answers both routes with synthetic data (the credits 401 without a token there
+  too).
 - **The person's titles:** `GET /library/people/{personId}/media` → `Metadata[]`, everything the
   person appears in **across EVERY library section in one request** (person 161 → 3 items;
   person 6059 → 6). This is the right call for a person page; `?actor=<id>` below is the right
@@ -248,6 +263,14 @@ Discover guid to a server's own ratingKey; `docs/watchlist.md`.)
 - **Only the primary `plex://` guid matches.** `plex://movie/<24 hex>` and `plex://show/<24 hex>`.
   `imdb://`, `tmdb://` and `tvdb://` (which the items carry in `Guid[]` with `includeGuids=1`) answer
   size 0, so a title with no `plex://` guid cannot be looked up this way.
+- **An episode's `grandparentGuid` is the show's catalog id.** Measured 2026-10-21 on the local PMS: it
+  is `plex://show/<24 hex>` even for an episode whose own `guid` is `local://N`, and it is the global
+  agent id, the same on every server using the Plex agent. Continue Watching groups on it
+  (`docs/shared-servers.md`, "One tile per show in Continue Watching").
+- **A scrobble restamps `lastViewedAt` and moves the deck.** `/:/scrobble` on a never-watched episode
+  set `viewCount=1` and `lastViewedAt` to now, and `/hubs/continueWatching/items` then listed the show's
+  next episode first with that same `lastViewedAt`; `/:/unscrobble` restored both. Every row of that
+  hub carried `Media[0].Part[0]` (the hub parse fills `PmsMovie::part` from it).
 - **`type` narrows and must be right.** `type=1` movies, `type=2` shows. A wrong `type` answers
   size 0, which is indistinguishable from "not held", so the call is made once per kind and the kind
   comes from the guid's own prefix. Rows carry `librarySectionID` and, when the server has them,
@@ -947,7 +970,7 @@ Byte-range serving works, so seek-by-range is available to the player.
 |---|---|---|
 | `container` | `mkv`, `mp4` | demuxer support check |
 | `videoCodec` | `h264`, `hevc` | webOS decoder check |
-| `audioCodec` | `ac3`, `eac3`, `aac` | audio passthrough/decode check |
+| `audioCodec` | `ac3`, `eac3`, `aac`, `dca` | audio passthrough/decode check. PMS spells DTS `dca` (every DTS entry in its shipped profiles does), the pipeline and the device table say `dts`: `devcaps::audio_codec_id` is the one canonicaliser, and the client profile names it `dca` too |
 | `width` / `height` | 1920/858, 3840/1920 | ≤ panel/decoder max (4K HEVC ok on most webOS) |
 | `bitrate` | 16248 (kbps) | LAN is fine; cap for Wi-Fi profiles |
 | `videoResolution` | `1080`, `4k` | coarse version picker among multiple `Media[]` |
@@ -1011,8 +1034,9 @@ for the raw captures behind this table.
 | M4 | Enhanced remux plus `subtitleStreamID` for an embedded SRT | `subtitles=embedded` or `=sidecar`: video copy, subtitle decision `unavailable` — PMS refuses to carry a text subtitle into the progressive MKV the enhancement produces. `subtitles=auto`: the server instead re-encodes the video and burns it. Either way a subtitle and the enhancement cannot share a route, which is I6. |
 | M5 | Part GET (`Range: bytes=0-1023`) on a transcode session, after MDE, after MDE followed by an enhanced-remux decision on the same session, and after only an enhanced decision | 206 Partial Content in every case from a host, including with the remux encoder still live, stopped physically, stopped with `closeResourceSession=1`, or abandoned. PR 4's device run nonetheless met a **503** on the Part right after releasing an enhanced remux; what PMS keyed it on did not reproduce off the television, so a release asks for the Part before it trials it and falls to the plain remux on a refusal (`route::decision::admit_original_part`). |
 | M6 | MDE `/decision` on a session whose transcoder is live | The MDE ENDS that transcoder: an HLS session's later segments answer 404 (200 without the MDE) and its stop 404; a progressive session's `start.mkv` at an offset on the same id answers 400 until it is re-decided. Re-issuing MDE is harmless only when nothing is live — never before a Part GET whose rollback needs the encoder still running. |
-| M7 | Enhanced remux plus an explicit `subtitleStreamID=<id>&subtitles=burn` for an embedded subtitle, instead of the `=embedded`/`=sidecar`/`=auto` shapes M4 measured | **Verified live (PMS 1.43.4, host, Guest identity, 2026-09-29)**, against our own transcode query shape plus `normalizeLoudness=1`. Enhanced remux + `subtitles=embedded`: video copy, the text subtitle is absent from the decision entirely, and a PGS one decides `unavailable` — confirming M4's refusal generalizes past SRT. Enhanced + `subtitles=burn` at a re-encode flavour (`videoResolution=3840x2160&maxVideoBitrate=60000`) on HDR10 4K sources, both SRT and PGS: video transcodes to HEVC 10-bit with `colorTrc` kept at `smpte2084` (confirmed by `ffprobe` on the output: `yuv420p10le`/`smpte2084`), the hardware encoder runs it, throughput measured 2.0–2.6× realtime, source resolution is kept (no downscale), and the PGS case's own decision reads `burn`. The SRT case lists no subtitle Stream in the decision at all even though the video is re-encoded — the burn happens, but the decision body gives no wire signal of it for a text track; a visual (on-screen) confirmation that the burned text actually appears is still pending the device run. The SAME sources with the enhancement OFF cost the identical video transcode — the burn itself is the cost, not the DSP params riding along with it. A Dolby Vision Profile 8 source asked to burn: PMS copies the video (`DOVIPresent=1` in the decision, matching `EnhancementRoute::RemuxDropsDolbyVision`'s "video copy" half) and silently drops the subtitle — confirming `DisabledReason::DolbyVisionSubtitle`'s refusal is not just this app being conservative; the server itself cannot do both. Official Plex clients ask for `subtitles=burn` explicitly rather than relying on `=auto`'s refuse-then-decide path M4 found; this app now does the same: an embedded subtitle forces `remux: false` (a real re-encode, `EnhancementRoute::Burn`) carrying both the DSP params and the burn request in the one decision, so the subtitle is never silently dropped (superseding I6's "cannot share a route" for the embedded case). An external sidecar stays on the ordinary enhanced remux and is drawn by the app over it: a remux contract never names a subtitle (see M8), and picking or clearing a sidecar on a live remux rebuilds nothing. |
+| M7 | Enhanced remux plus an explicit `subtitleStreamID=<id>&subtitles=burn` for an embedded subtitle, instead of the `=embedded`/`=sidecar`/`=auto` shapes M4 measured | **Verified live (PMS 1.43.4, host, Guest identity, 2026-09-29)**, against our own transcode query shape plus `normalizeLoudness=1`. Enhanced remux + `subtitles=embedded`: video copy, the text subtitle is absent from the decision entirely, and a PGS one decides `unavailable` — confirming M4's refusal generalizes past SRT. Enhanced + `subtitles=burn` at a re-encode flavour (`videoResolution=3840x2160&maxVideoBitrate=60000`) on HDR10 4K sources, both SRT and PGS: video transcodes to HEVC 10-bit with `colorTrc` kept at `smpte2084` (confirmed by `ffprobe` on the output: `yuv420p10le`/`smpte2084`), the hardware encoder runs it, throughput measured 2.0–2.6× realtime, source resolution is kept (no downscale), and the PGS case's own decision reads `burn`. The SRT case lists no subtitle Stream in the decision at all even though the video is re-encoded — the burn happens, but the decision body gives no wire signal of it for a text track; a visual (on-screen) confirmation that the burned text actually appears is still pending the device run. The SAME sources with the enhancement OFF cost the identical video transcode — the burn itself is the cost, not the DSP params riding along with it. A Dolby Vision Profile 8 source asked to burn: PMS copies the video (`DOVIPresent=1` in the decision, matching the enhanced remux's video copy) and silently drops the subtitle — confirming `DisabledReason::DolbyVisionSubtitle`'s refusal is not just this app being conservative; the server itself cannot do both. Official Plex clients ask for `subtitles=burn` explicitly rather than relying on `=auto`'s refuse-then-decide path M4 found; this app now does the same: an embedded subtitle forces `remux: false` (a real re-encode, `EnhancementRoute::Burn`) carrying both the DSP params and the burn request in the one decision, so the subtitle is never silently dropped (superseding I6's "cannot share a route" for the embedded case). An external sidecar stays on the ordinary enhanced remux and is drawn by the app over it: a remux contract never names a subtitle (see M8), and picking or clearing a sidecar on a live remux rebuilds nothing. |
 | M8 | **UNMEASURED** — a remux (plain or enhanced) whose subtitle the app draws sends `subtitleStreamID=0&subtitles=none` on the transcode leg (`route::plan::transcode_spec`, `TranscodeSpec::client_subtitles`) | The spelling is the MDE handshake's client-rendered mode (`Client::mde_decision`), which PMS has accepted before; it has not been sent on a `/video/:/transcode/universal/decision` or `start.mkv` request. Expected: video copy, subtitle absent from the decision, no re-encode. A TV or host run must confirm PMS does not answer `auto`'s refuse-then-decide path or burn the part's own selected subtitle instead. **A TV run on 2026-10-06** showed PMS serving the Part to a fresh session id (`<live>-subs`) during a live remux, which is what the side reader (`player::subside`, `route::side_reader_target`) reads for an embedded subtitle. **Measured on the same TV (2026-10-06):** a Part `Range` read during a live remux answers 503 when it carries that remux session id and 206 with a fresh or absent session id; so a release from a remux (or burn) back to Direct Play (`route::decision::OriginalRecoveryPlan::direct_session`) probes and opens the Part on a freshly minted session id and stops the old remux once decoded frames confirm, while a release from a live hls encoder keeps that encoder's id (the Part shares its Streaming Resource). Whether `subtitles=none` on the start leg keeps the video a copy is still UNMEASURED: that run sent the dev trigger's remux with no subtitle selected. |
+| M9 | Enhanced remux (`directStream=1&directStreamAudio=1&boostDialog=1&subtitles=none`, `start.mkv`) of a Dolby Vision Profile 8 and a Profile 7 FEL source | **Measured 2026-10-19 (PMS 1.43.4.10903, host, Guest identity; the dev TV for the picture).** Both `/decision` answers copied the video (`decision=copy`), the decision Stream carrying `DOVIPresent=1` and the source's `DOVIProfile`. `ffprobe` of the output found the DOVI configuration record intact (P8: profile 8, compat 1; P7: profile 7, `el_present` 1, `bl_present` 1, compat 6), and the P7 output still carried its UNSPEC62 RPUs and UNSPEC63 enhancement-layer NALs. On the dev TV both played with the panel in Dolby Vision (Glasshouse `picture.dynamicRange`), the P7 one with the app's P7→P8.1 conversion armed on the remuxed stream. So a video copy keeps the declaration the file would have made as a direct play, and `route::plan::copied_video_dv` declares it. With an embedded subtitle selected the server instead re-encoded the video to burn it (`decision=transcode`), and no declaration is made. |
 
 **Known device-only gap on M5 (`audio_enhancement_normalize_reset`, `tests/manifest.json`, 2026-09-29).**
 Admitting the Part before the trial (`admit_original_part`) does not close the 503 in every case (the admission and the trial now read the Part on a fresh session id rather than the remux's, per M8, which this entry predates; whether that closes the case below is unmeasured):
@@ -1030,7 +1054,7 @@ understood or worked around; a release from a session that has posted playing ti
 Direct Play only when PMS admits the Part, otherwise it returns to the plain Original remux.
 
 **Client-side reading.** `route::plan::enhancement_availability` (I1-I7, M7) gates the ASK and its
-flavour (`EnhancementRoute::Remux` / `RemuxDropsDolbyVision` / `Burn`, or a `DisabledReason` for
+flavour (`EnhancementRoute::Remux` / `Burn`, or a `DisabledReason` for
 every gate but "no Plex Pass" — see M7); the wire params are never sent outside a Direct/Remux
 target even when the viewer's preference is on (M3, I5).
 `route::EnhancementOutcome` grades the ANSWER from the params' own observability in the table above:

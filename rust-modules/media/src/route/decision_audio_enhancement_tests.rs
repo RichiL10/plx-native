@@ -1595,19 +1595,20 @@ fn dv_declared() -> plx_data::metadata::DvDecision {
 /// The source of the device report: 4K HEVC, Dolby Vision P7, the facts frozen at playback start.
 fn make_4k_dv_source(ps: &mut PlaybackSession) {
     ps.cur_src = (60_000, 3_840, 2_160);
-    ps.item_dovi = dv_p7();
-    ps.item_dv_decision = dv_declared();
+    ps.src_dovi = dv_p7();
+    ps.src_dv_decision = dv_declared();
 }
 
-/// FORK (RichiL10) D1: the item's DV facts survive any route that dropped them and are declared
-/// again by the next route that copies the video; a re-encode or an undeclared item gets none.
+/// FORK (RichiL10) D1: the file's DV facts (`src_dovi`, frozen at the resolve) survive any route
+/// that dropped them and are declared again by the next route that copies the video (upstream
+/// #839's `plan::copied_video_dv`); a re-encode gets none.
 #[test]
-fn fork_copied_video_dv_prefers_the_item_facts() {
+fn fork_copied_video_dv_hands_on_the_file_facts() {
     let none = (plx_data::metadata::Dovi::NONE, plx_data::metadata::DvDecision::NONE);
-    let item = (dv_p7(), dv_declared());
-    assert_eq!(copied_video_dv(item, none).map(|(d, _)| d.profile), Some(7));
-    assert_eq!(copied_video_dv(none, item).map(|(d, _)| d.profile), Some(7));
-    assert!(copied_video_dv(none, none).is_none());
+    let remux = plx_plex::plex::EncodeContract { remux: true, ..Default::default() };
+    let reencode = plx_plex::plex::EncodeContract { remux: false, ..Default::default() };
+    assert_eq!(copied_video_dv(None, &remux, dv_p7(), dv_declared()).0.profile, 7);
+    assert_eq!(copied_video_dv(None, &reencode, dv_p7(), dv_declared()), none);
 }
 
 /// FORK (RichiL10) D1 (brief test 1): a burn on a DV source (`sub_burn=allow`) dropped the
@@ -1832,7 +1833,7 @@ fn fork_burn_refusal_covers_4k_or_dolby_vision() {
     assert!(burn_refused_for_source(&ps));
     ps.cur_src = (8_000, 1_920, 1_080);
     assert!(!burn_refused_for_source(&ps), "a 1080p SDR source still burns");
-    ps.item_dovi = dv_p7();
+    ps.src_dovi = dv_p7();
     assert!(burn_refused_for_source(&ps));
     set_sub_burn_for_test(Some(true));
     assert!(!burn_refused_for_source(&ps), "sub_burn=allow is upstream's burn");
@@ -3119,9 +3120,10 @@ fn the_stale_arms_of_the_drain_stop_their_encoder_off_the_frame_thread() {
             url: String::new(),
             vcodec: "hevc".into(),
             acodec: "ac3".into(),
+            dovi: plx_data::metadata::Dovi::NONE,
+            dv_decision: plx_data::metadata::DvDecision::NONE,
             contract: plx_plex::plex::EncodeContract::default(),
             enhancement: EnhancementOutcome::Off,
-            video_copied: false,
             ticket,
             client,
             superseded: String::new(),
@@ -3243,9 +3245,10 @@ fn a_stale_landing_at_drain_time_stops_the_leaked_encoder_instead_of_installing_
             ),
             vcodec: "hevc".into(),
             acodec: "ac3".into(),
+            dovi: plx_data::metadata::Dovi::NONE,
+            dv_decision: plx_data::metadata::DvDecision::NONE,
             contract: plx_plex::plex::EncodeContract::default(),
             enhancement: EnhancementOutcome::Off,
-            video_copied: false,
             ticket: leaked_ticket,
             client: cur_client(&ps).expect("install() registered this session's server"),
             superseded: String::new(),

@@ -260,12 +260,7 @@ fn dv_decision_survives_reload_recovery_and_rollback() {
         false,
         plx_platform::devcaps::dv::DvCapability::Supported,
     ));
-    clear_output_dv(&mut ps);
-    assert_eq!(
-        stream_dv_decision(&ps),
-        plx_data::metadata::DvDecision::NONE,
-        "the shared remux/transcode output reset clears the declaration",
-    );
+    // The copy rule itself (`copied_video_dv`) is covered in `plan_dolby_vision_tests.rs`.
 
     restore_quality(Quality::Original);
     install_active_encoder("");
@@ -2838,8 +2833,8 @@ fn manual_original_after_a_fixed_rung_with_a_subtitle_returns_to_direct_play() {
     crate::player::reset_subtitle();
 }
 
-/// A video-copy progressive remux is still the source HEVC stream; its frozen declaration must
-/// survive the server-output reset used by real video encodes.
+/// A video-copy progressive remux is still the source HEVC stream: the rule every server-built
+/// route asks (`plan::copied_video_dv`, #839) hands the frozen declaration on.
 #[test]
 fn a_video_copy_remux_keeps_its_frozen_dolby_vision_declaration() {
     let mut ps = PlaybackSession::IDLE;
@@ -2853,19 +2848,18 @@ fn a_video_copy_remux_keeps_its_frozen_dolby_vision_declaration() {
         false,
         plx_platform::devcaps::dv::DvCapability::Supported,
     ));
-    let frozen = stream_dv_decision(&ps);
-    ps.cur_contract = plx_plex::plex::EncodeContract::original(
+    let frozen = (stream_dovi(&ps), stream_dv_decision(&ps));
+    let remux = plx_plex::plex::EncodeContract::original(
         true,
         plx_plex::plex::AudioEnhancements::NONE,
     );
-    clear_output_dv(&mut ps);
-    assert_eq!(stream_dv_decision(&ps), frozen);
-    assert_eq!(stream_dovi(&ps).profile, 8);
+    assert_eq!(copied_video_dv(None, &remux, frozen.0, frozen.1), frozen);
+    assert_eq!(copied_video_dv(None, &remux, frozen.0, frozen.1).0.profile, 8);
     reset_session(&mut ps);
 }
 
 /// FORK (RichiL10): the knob `remux_dv=off` turns the remux declaration off: the video-copy remux
-/// then declares nothing, as upstream's.
+/// then declares nothing, as upstream did before #839.
 #[test]
 fn fork_knob_remux_dv_off_declares_nothing_on_a_video_copy_remux() {
     let mut ps = PlaybackSession::IDLE;
@@ -2879,12 +2873,15 @@ fn fork_knob_remux_dv_off_declares_nothing_on_a_video_copy_remux() {
         false,
         plx_platform::devcaps::dv::DvCapability::Supported,
     ));
-    ps.cur_contract = plx_plex::plex::EncodeContract::original(
+    let frozen = (stream_dovi(&ps), stream_dv_decision(&ps));
+    let remux = plx_plex::plex::EncodeContract::original(
         true,
         plx_plex::plex::AudioEnhancements::NONE,
     );
-    plx_base::forkknobs::with_conf_for_test(Some("remux_dv=off\n"), || clear_output_dv(&mut ps));
-    assert_eq!(stream_dv_decision(&ps), plx_data::metadata::DvDecision::NONE);
-    assert!(!stream_dovi(&ps).present);
+    let (dovi, decision) = plx_base::forkknobs::with_conf_for_test(Some("remux_dv=off\n"), || {
+        copied_video_dv(None, &remux, frozen.0, frozen.1)
+    });
+    assert_eq!(decision, plx_data::metadata::DvDecision::NONE);
+    assert!(!dovi.present);
     reset_session(&mut ps);
 }

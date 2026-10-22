@@ -184,7 +184,7 @@ APPPORT      = $(if $(filter stable,$(FLAVOR)),8910,$(if $(filter nightly,$(FLAV
 
 QUERY_GOALS = print-flavor print-appid print-appdir print-rundir print-eventlog print-appport print-tv \
               print-simbin print-app-files print-deploy-files print-sentry-handler print-ffmpeg-staged \
-              print-sentry-project print-bench-config
+              print-sentry-project print-bench-config print-disk-entries
 print-flavor:   ; @echo '$(FLAVOR)'
 print-appid:    ; @echo '$(APPID)'
 print-appdir:   ; @echo '$(APPDIR)'
@@ -224,8 +224,9 @@ print-bench-config:
 # `make disk` — what every checkout of this repository is costing, in one table, plus how to get
 # it back. It is a report; `tools/build-gc.sh --incremental|--lanes|--all` is the reclaim, and
 # the script's header carries the measurement that motivated all three. Nothing here has to be run
-# by hand anymore: `tools/build-gc.sh --auto` runs the same reclaim on its own, staged by free-space
-# pressure, from a `SessionEnd` hook (`.claude/hooks/build-gc-auto.sh`) and from the per-user
+# by hand anymore: `tools/build-gc.sh --auto` reclaims on its own, gated by free space (the order
+# past the cheap modes is the planner's, `tools/disk-budget.py`, which the report's last section
+# prints), from a `SessionEnd` hook (`.claude/hooks/build-gc-auto.sh`) and from the per-user
 # launchd agent `disk-watch` installs below — `make disk` remains the report to read when deciding
 # whether to intervene by hand.
 disk: ; @./tools/build-gc.sh
@@ -540,7 +541,7 @@ ARM_PROFILE_FLAG = $(if $(filter release,$(ARM_PROFILE)),--release,--profile $(A
 #
 # A HOST_THREADS above 1 on a non-nightly toolchain is a hard error here rather than a cargo failure
 # in the middle of a recipe. Which recipes: ONLY the host `cargo test` / `check-cargo-unit-*` builds,
-# `test-fast`, `test-crate` and `build-bench` carry `$(HOST_ENV)`. It is NOT exported, so the ARM
+# `test-fast`, `test-crate`, `test-hostsim` and `build-bench` carry `$(HOST_ENV)`. It is NOT exported, so the ARM
 # staticlib recipes (which set RUSTFLAGS themselves), the simulators' builds, clippy and the package
 # steps never see it (ci/test_host_threads.py pins both). 0 and 1 mean the serial front end. A
 # RUSTFLAGS the caller exported wins over it (cargo reads CARGO_BUILD_RUSTFLAGS last).
@@ -780,7 +781,11 @@ RUST_CFG       = features:$(RUST_FEATFLAGS)$(if $(filter-out release,$(ARM_PROFI
 # SEE the refusal message the cut-release skill quotes. Without it, asking that question on a
 # different configuration deleted `pkg/plxnative`, the FFmpeg header sentinel and the staged
 # libraries — measured, by a reviewer, mid-review.
-SIDE_EFFECT_FREE = $(QUERY_GOALS) release-guard lab-guard disk build-bench build-bench-quick
+#
+# `test-hostsim` and `check-nodef` join `build-bench` for the same reason: each only runs host cargo
+# in a tree under `rust-modules/`, builds none of the TV artifacts, and must not delete a release
+# binary because its caller's configuration differs from the stamp.
+SIDE_EFFECT_FREE = $(QUERY_GOALS) release-guard lab-guard disk disk-preflight build-bench build-bench-quick test-hostsim check-nodef
 PURE_QUERY := $(if $(MAKECMDGOALS),$(if $(filter-out $(SIDE_EFFECT_FREE),$(MAKECMDGOALS)),,yes),)
 ifneq ($(PURE_QUERY),yes)
 ifneq ($(RUST_CFG),$(shell cat $(RUST_STAMP) 2>/dev/null))
@@ -1424,19 +1429,59 @@ clean:
 
 test: deploy run
 
-# `disk-preflight` — refuse to start a gate on a nearly full volume. A cold build writes several GB
-# under the checkout's `target/`; on a full disk the failure is `No space left on device (os error
-# 28)` deep inside rustc or the replay driver, which reads exactly like a code failure (2026-10-16:
-# three "blocking" gate FAILs were all ENOSPC, and the same sha passed once space was freed).
-# `PLX_MIN_FREE_MB` is the floor (default 3072); `PLX_MIN_FREE_MB=0` skips it.
+# `disk-preflight` — the disk budget, checked at EVERY build entry (docs/disk-budget.md). A cold build
+# writes several GB under its target dir; on a full disk the failure is `No space left on device (os error
+# 28)` deep inside rustc or the replay driver, which reads exactly like a code failure (2026-10-16: three
+# "blocking" gate FAILs were all ENOSPC, and the same sha passed once space was freed). So each target that
+# starts cargo, listed once in DISK_ENTRIES, has `disk-preflight` as an ORDER-ONLY prerequisite, and the
+# recipe is `tools/disk-budget.py preflight`:
+#   * 20 GiB or more free (PLX_GC_MIN_FREE_GIB): one statvfs and nothing else, ~22 ms;
+#   * below that: plan a reclaim that spares the tree being built and every live tree (the checkout's other
+#     trees lose only their incremental dirs, and only as a last resort), hand it to `build-gc.sh --evict`,
+#     re-read the free space, and go on if the build fits;
+#   * refuse (exit 1, with the reason) only when the whole ladder cannot cover the build's estimate plus the
+#     reserve (PLX_MIN_FREE_MB, default 3072), i.e. when the build would hit ENOSPC anyway.
+# `PLX_MIN_FREE_MB=0` skips it. A recipe that re-enters make for a hooked target sets
+# PLX_DISK_BUDGET_DONE=1 on that line, so the child does not run it a second time.
+#
+# ORDER-ONLY (after the `|`): a phony normal prerequisite would make every FILE target in the list out of
+# date on every run. It still runs on a `make` that has nothing to do (the fast path, ~22 ms); below
+# the comfort line that is also the moment a reclaim happens, which is the point.
+#
+# DISK_TREE is the cargo target dir the entry writes (absolute), DISK_NEED the entry's estimate in GiB when
+# it is not the table's value for that dir's name (tools/disk-budget.py NEED_GIB). `ci/test_disk_preflight.py`
+# finds every target whose recipe runs cargo and fails when one is missing from this list.
+DISK_ENTRIES = check check-replay check-cargo-lint check-cargo-unit-default check-cargo-unit-hostsim lint \
+               test-fast test-crate test-hostsim check-nodef check-ass check-ffmpeg sim-macos sim-linux screenshots-sim site-video-sim \
+               $(RUST_LIB) pkg/plxnative-storage macapp macapp-zip build-bench build-bench-quick
+$(DISK_ENTRIES): | disk-preflight
+
+# A relative CARGO_TARGET_DIR is relative to rust-modules, where cargo runs.
+DISK_TREE = $(if $(CARGO_TARGET_DIR),$(if $(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),$(CURDIR)/rust-modules/$(CARGO_TARGET_DIR)),$(CURDIR)/rust-modules/target)
+DISK_NEED =
+test-fast test-crate: DISK_TREE = $(CURDIR)/rust-modules/$(TEST_FAST_TDIR)
+test-hostsim: DISK_TREE = $(CURDIR)/rust-modules/$(TEST_HOSTSIM_TDIR)
+check-replay sim-macos: DISK_TREE = $(abspath $(SIM_TDIR)$(if $(LAB),-lab,))
+sim-linux: DISK_TREE = $(abspath $(SIM_LINUX_TDIR_ENV))
+screenshots-sim: DISK_TREE = $(abspath $(SHOT_TDIR))
+site-video-sim: DISK_TREE = $(abspath $(SITE_VIDEO_TDIR))
+macapp macapp-zip: DISK_TREE = $(abspath $(MACAPP_TDIR))
+# The ARM builds add far less than the host's: 0.6 GiB (`tvdev`) or 0.45 GiB (`release`), 0.15 for the helper.
+$(RUST_LIB): DISK_TREE = $(CURDIR)/rust-modules/$(RUST_TDIR)
+$(RUST_LIB): DISK_NEED = $(if $(filter release,$(ARM_PROFILE)),0.45,0.6)
+pkg/plxnative-storage: DISK_TREE = $(CURDIR)/rust-modules/$(STORAGE_TDIR)
+pkg/plxnative-storage: DISK_NEED = 0.15
+# The benchmark's worst case: the host `target` AND a test-fast tree built from nothing (only `ARGS=--cold`
+# builds it; a plain run reuses an existing one or skips the -inc rows).
+build-bench build-bench-quick: DISK_NEED = 6.1
+
 .PHONY: disk-preflight
 disk-preflight:
-	@min=$${PLX_MIN_FREE_MB:-3072}; \
-	free=$$(df -Pk . | awk 'NR==2 {print int($$4/1024)}'); \
-	if [ "$$min" -gt 0 ] && [ "$$free" -lt "$$min" ]; then \
-	  echo "disk-preflight: only $$free MiB free here (< $$min MiB); a build would fail with ENOSPC (os error 28), not a code failure. Free space first: make disk; tools/build-gc.sh --auto (or PLX_MIN_FREE_MB=0 to skip)." >&2; \
-	  exit 1; \
-	fi
+	@python3 tools/disk-budget.py preflight --tree '$(DISK_TREE)'$(if $(DISK_NEED), --need-gib $(DISK_NEED))
+
+# The targets that carry the prerequisite, one per line: the list `ci/test_disk_preflight.py` checks every
+# cargo-running target against (a `make -s print-*` query, never `make -p`).
+print-disk-entries: ; @printf '%s\n' $(DISK_ENTRIES)
 
 # `make check` is a machine-wide QUEUE with TWO slots, not a direct alias for the suite below. On
 # 2026-09-28, ~7 agent worktrees ran `make check` at once on one 10-core/16 GB Mac: each
@@ -1451,8 +1496,8 @@ disk-preflight:
 # `PLX_CHECK_LOCK=off` bypasses the lock. A second run from the SAME checkout always
 # waits for the first. See `check-unlocked` below for the actual
 # suite; CI runs `make check` uncontended, so the wrapper acquires immediately there.
-check: disk-preflight
-	@python3 tools/check-lock.py -- $(MAKE) --no-print-directory check-unlocked
+check:
+	@PLX_DISK_BUDGET_DONE=1 python3 tools/check-lock.py -- $(MAKE) --no-print-directory check-unlocked
 
 # `make check` — the HOST unit suite plus `lint` below, the only correctness signal
 # available without a television. Deliberately NOT a prerequisite of `all`: the normal build is a
@@ -1664,6 +1709,86 @@ test-crate:
 	  $(HOST_ENV) \
 	  python3 ../tools/test-crate.py --suite '$(UNIT_SUITE)' --cargo 'cargo +$(RUST_TOOLCHAIN)' $(if $(DEPS),--deps) $(if $(T),--filter '$(T)') $(C)
 
+# `make test-hostsim [C=<crate>...] [T=filter]` -- the `hostsim` tests: the ones under
+# `#[cfg(all(test, feature = "hostsim"))]` (the application crate's `app/run.rs`
+# `lifecycle_regression_tests`, the player-return rig; `plx_media`'s `player/engine.rs`, `pump.rs`,
+# `route/decision.rs`), which `test-fast` and `test-crate` do not compile because the feature is off
+# in the default set. `C` is the crate under test, spelled as for `test-crate` (`C=plx_media` or
+# `C=media`; the application crate, the default, is `C=app`; several allowed), and it is the ONLY
+# thing `C` changes: the same recipe, the same managed dir, the same `--require-match`. The features
+# are the crate's own plus `hostsim`, not the application crate's defaults the full suite unifies in
+# (`test-crate` documents that gap); `C=plx_media` measured identical to the suite's line (1839
+# passed, 60 ignored, 2026-10-19). It is the managed form of what AGENTS.md used to hand out as a recipe,
+# `CARGO_INCREMENTAL=1 CARGO_TARGET_DIR=/tmp/<dir> cargo test --lib -p plxnative-modules --features
+# hostsim`: every agent picked its own `/tmp/<dir>`, nothing tracked them, and on 2026-10-19 there
+# were 28 PlxNative cargo trees there, 45.6 GiB, none of them known to `make disk` or `build-gc`.
+#
+# The target dir is `rust-modules/$(TEST_HOSTSIM_TDIR)`, INSIDE the checkout like `target-fast`: it is
+# gitignored, `tools/build-gc.sh --incremental` drops its `debug/incremental` and `--lanes` /
+# `--all` the whole tree (both glob `rust-modules/target*`), and it goes with the worktree.
+# `tools/cargo-seed.py` never touches it (it handles only `target` and `target-release`).
+#
+# INCREMENTAL, FORCED ON, for the reason `test-fast` is: this is an inner loop you ask for by
+# typing the target, not something `check` does. The only measured numbers for such a loop are
+# `test-fast`'s (full default-feature suite, 5 interleaved rounds, 2026-10-01: edit-rebuild ~10 s
+# against 31-32 s non-incremental; cold 51.7 s against 46.2 s; tree ~2.7 GB against ~1.0 GB; see
+# `test-fast` below). They are not hostsim's own -- this one builds the application crate only --
+# so the claim here is the direction, not the figures; the PR that added this target reports one
+# measured cold build and tree size. It is forced rather than `?=`, because a linked worktree
+# exports `CARGO_INCREMENTAL=0` (above) and would otherwise turn the loop into the slow path it
+# exists to avoid; and it is safe for the disk because the cache lives in this dir only, which
+# build-gc reclaims. Nothing in `check*`, `lint` or CI names the dir.
+#
+# The same environment as `check-cargo-unit-hostsim` (pinned toolchain, throwaway
+# `PLXNATIVE_RUNTIME_DIR` -- honoured here because `hostsim` is what makes it steerable --, the
+# telemetry words and HOST_ENV), run through $(UNIT_RUN) so the binary gets its own runtime
+# subdirectory and an empty TMPDIR it must leave empty. `--require-match` makes a filter that
+# matches no test FAIL: libtest prints `0 passed ... N filtered out` and exits 0, which a mistyped
+# `T=` reads exactly like a green run. Refused under RELEASE=1 like `test-fast`.
+TEST_HOSTSIM_TDIR = target-hostsim
+HOSTSIM_PKGS = $(foreach c,$(or $(strip $(C)),app),$(if $(filter app,$(c)),plxnative-modules,$(if $(filter plx_% plxnative-modules,$(c)),$(c),plx_$(c))))
+.PHONY: test-hostsim
+test-hostsim:
+	@$(if $(RELEASE),echo "make test-hostsim: refused under RELEASE=1 -- it runs the default-plus-hostsim feature set incrementally; RELEASE=1 is the shipping feature set (use make check-nodef for that)." >&2; exit 1,:)
+	@echo "test-hostsim: incremental hostsim tests of $(HOSTSIM_PKGS) in rust-modules/$(TEST_HOSTSIM_TDIR) -- see 'make disk'; reclaim it with: tools/build-gc.sh --incremental (cache) or rm -rf rust-modules/$(TEST_HOSTSIM_TDIR)"
+	@set -e; d=$$(mktemp -d /tmp/plxnative-check.XXXXXX); trap 'rm -rf "'"$$d"'"' EXIT; \
+	cd rust-modules && CARGO_INCREMENTAL=1 CARGO_TARGET_DIR=$(TEST_HOSTSIM_TDIR) \
+	  PATH="$$HOME/.cargo/bin:$$PATH" PLXNATIVE_RUNTIME_DIR="$$d" \
+	  $(TELEMETRY_ENV) \
+	  $(HOST_ENV) \
+	  $(UNIT_RUN) --require-match $(if $(T),--filter '$(T)') -- cargo +$(RUST_TOOLCHAIN) test --lib $(addprefix -p ,$(HOSTSIM_PKGS)) --features hostsim
+
+# `make check-nodef` -- type-check the SHIPPING feature set (`--no-default-features`: devtools,
+# devtriggers and threadcheck off, what `RELEASE=1` builds). `make check`, `make` and `make sim` all
+# build the DEV features, so a break that only the release set has is invisible to every one of them
+# (docs/agent-reference.md; AGENTS.md says when to run it). It replaces the hand command
+# `CARGO_INCREMENTAL=0 cargo +<pin> check --manifest-path rust-modules/Cargo.toml --lib
+# --no-default-features`, which agents ran into their own `/tmp/<x>-nodef` trees.
+#
+# It SHARES the checkout's `target` (or the `CARGO_TARGET_DIR` a fleet lane exports, as `lint` and
+# `make check` do) and adds no tree. Sharing is safe, measured 2026-10-19 with `cargo ...
+# --unit-graph` (nothing compiled) against the units `make lint` builds: of the 165 units this command needs, 139 are
+# third-party crates whose package, target, mode, features and profile are identical to lint's, so
+# cargo reuses their artifacts; the 26 others are the workspace crates, whose FEATURES differ
+# (`--no-default-features` stops the app package forwarding devtools / devtriggers / threadcheck into
+# every layer crate), so each gets its own metadata hash and file names and coexists with the dev
+# set instead of replacing it. `check` writes only hashed `.rmeta`, so there is no unhashed output
+# for the two to collide on (the `.a` collision that gave RELEASE its own dir does not apply).
+# It must therefore NOT carry $(HOST_ENV) or $(TELEMETRY_ENV): they would change RUSTFLAGS or
+# build-script inputs and make the third-party units differ from lint's. The cost of sharing is
+# cargo's build-directory lock, which makes this wait for a `cargo` already running in the same
+# tree for as long as that one invocation lasts.
+#
+# The seed restore is the same line `lint` starts with: `restore` only fills an ABSENT dir, so a
+# fresh lane whose first cargo call is this one would otherwise create `target` unseeded and every
+# later `make check` there would build third-party cold. `CARGO_INCREMENTAL=0`: a one-shot gate has
+# no use for an incremental cache, and (unlike `test-hostsim`) there is no loop here.
+.PHONY: check-nodef
+check-nodef:
+	$(CARGO_SEED) restore target rust-modules/target --env-var CARGO_TARGET_DIR --env-base rust-modules
+	@set -e; cd rust-modules && CARGO_INCREMENTAL=0 PATH="$$HOME/.cargo/bin:$$PATH" \
+	  cargo +$(RUST_TOOLCHAIN) check --lib --no-default-features
+
 # `make build-bench [ARGS='--runs 5 --json out.json']` -- the repeatable local build benchmark
 # (tools/build-bench.py; docs/agent-reference.md says what it measures and when a PR must paste its
 # table). `build-bench-quick` is no-op + leaf edit + sizes at one run. It runs the SAME cargo
@@ -1678,7 +1803,7 @@ test-crate:
 .PHONY: build-bench build-bench-quick
 build-bench build-bench-quick:
 	@$(if $(RELEASE),echo "make $@: refused under RELEASE=1 -- it benchmarks the default-feature host build; RELEASE=1 is the shipping feature set." >&2; exit 1,:)
-	@python3 tools/check-lock.py --exclusive -- env PLX_BENCH_VIA_MAKE=1 $(TELEMETRY_ENV) $(HOST_ENV) \
+	@python3 tools/check-lock.py --exclusive -- env PLX_BENCH_VIA_MAKE=1 PLX_DISK_BUDGET_DONE=1 $(TELEMETRY_ENV) $(HOST_ENV) \
 	  python3 tools/build-bench.py $(if $(filter build-bench-quick,$@),--quick) $(ARGS)
 
 # `check-python` is TWO branches run at once (tools/check-parallel.py, the same helper as
@@ -2017,7 +2142,7 @@ install: ipk tv-lock-require
 	  luna://com.webos.appInstallService/dev/install \
 	  \"{\\\"id\\\":\\\"$(APPID)\\\",\\\"ipkUrl\\\":\\\"/tmp/$(notdir $(IPK))\\\",\\\"subscribe\\\":true}\"" /dev/null' | head -20
 	$(SSH) 'rm -f /tmp/$(notdir $(IPK))'
-	@$(MAKE) --no-print-directory deploy FLAVOR=$(FLAVOR) RELEASE=$(RELEASE)
+	@PLX_DISK_BUDGET_DONE=1 $(MAKE) --no-print-directory deploy FLAVOR=$(FLAVOR) RELEASE=$(RELEASE)
 	@echo "installed and deployed $(APPID)"
 
 # Remove a flavour from the television. Refuses the stable id: uninstalling the app the household
@@ -2169,10 +2294,12 @@ $(FFMPEG_HOST_STAGED): pkg/%.dylib: $(FFMPEG_HOST_INC)/libavformat/avformat.h ci
 # `#[ignore]`d in the plain suite; the first is the zlib-compressed PGS track that no configure
 # flag change may silently drop again (`ff_image_subtitle_tests.rs`). macOS only, like the staging.
 # The ASS reader tests also need staged libass to compare caption pixels after packet ingestion.
+# `ff::late_audio_tests` demux real MKVs generated by the `ffmpeg`/`ffprobe` command line tools (brew's, in CI)
+# through the real `aq` lanes: audio starting late (video lane full first) and audio stored ahead of video (#600).
 # FORK (RichiL10): plus the AC3 encode lane's round trip through the bundled ac3_fixed (ff_enc.rs).
 check-ffmpeg: $(FFMPEG_HOST_STAGED) $(LIBASS_HOST_STAGED)
 	cd rust-modules && CARGO_INCREMENTAL=0 PLX_FFMPEG_DIR=$(CURDIR)/pkg PATH="$$HOME/.cargo/bin:$$PATH" \
-	  cargo +$(RUST_TOOLCHAIN) test --lib -p plx_media -- ff::image_subtitle_tests ff::subtitle_charset_tests ff::subside::tests::side_reader_draws_a_shifted_cue_from_a_generated_mkv ff::enc::tests::a_71_sine_round_trips_to_640_kbps_ac3 --ignored
+	  cargo +$(RUST_TOOLCHAIN) test --lib -p plx_media -- ff::image_subtitle_tests ff::subtitle_charset_tests ff::subside::tests::side_reader_draws_a_shifted_cue_from_a_generated_mkv ff::late_audio_tests ff::enc::tests::a_71_sine_round_trips_to_640_kbps_ac3 --ignored
 
 # The same ABI gate the cross build runs, at the other pointer width. ci/ffabi-assert.c `#if`s on
 # `__SIZEOF_POINTER__` and carries both tables, so this compile is what holds ff.rs's 64-bit
@@ -2202,7 +2329,7 @@ sim-macos: $(FFMPEG_HOST_STAGED) $(LIBASS_HOST_STAGED) pkg/.ffabi-host-ok
 # Full product replay is a renderer-backed host gate. Keep the fast unit suite usable without
 # a window system; Simulator CI runs this same driver against the simulator it just built.
 .PHONY: check-replay
-check-replay: disk-preflight sim-macos
+check-replay: sim-macos
 	python3 tests/replay_fixtures.py --sim "$$SIM_MACOS_BIN_ENV"
 
 # **`make screenshots` — the documentation screenshots, regenerated.** Boots the simulator once per

@@ -525,11 +525,12 @@ impl Dovi {
     /// - the direct-play gate **when no node will be sent** (`presentation` is written in terms of
     ///   this, so the two can never contradict each other), and
     /// - the server's permission to **COPY** the video — a remux or a `directStream` transcode
-    ///   hands us the identical elementary stream one container down, and the Load payload built
-    ///   for that path declares nothing. `route::build_stream` reads it for both
-    ///   ([`plx_plex::plex::TranscodeSpec::no_video_copy`] and the `remux` gate) and that is why a
-    ///   declared Profile 5 still refuses a copy: the declaration rides the DIRECT PLAY, not the
-    ///   file, so the same pixels arriving by another route are as wrong as they ever were.
+    ///   hands us the identical elementary stream one container down. A copy of a usable base
+    ///   layer keeps the file's declaration (the DOVI record travels in the stream, so the Load
+    ///   payload describes it as a direct play's would), but a copy of an unusable one (Profile 5)
+    ///   is refused and never declared. `route::build_stream` reads it for both
+    ///   ([`plx_plex::plex::TranscodeSpec::no_video_copy`] and the `remux` gate): the same pixels
+    ///   arriving by another route are as wrong as they ever were.
     ///
     /// Two disqualifiers, and they are found by different fields:
     /// - **an enhancement layer** (`el_present`) — one elementary stream is all the pipeline
@@ -593,8 +594,8 @@ impl Dovi {
     /// `signal` retains `nodv`'s diagnostic asymmetry: it withholds a Profile-5-style declaration,
     /// but does not suppress a compatible Profile 8 on a supported set. `capability` must be a
     /// definite [`Supported`](plx_platform::devcaps::dv::DvCapability::Supported), and
-    /// `video_is_hevc` closes the old Profile 9 disagreement where the gate declared AVC and the
-    /// payload's H265 guard silently discarded the node.
+    /// `video_carries_dv` ([`dv_video_codec`]) closes the old Profile 9 disagreement where the gate
+    /// declared AVC and the payload's codec guard silently discarded the node.
     ///
     /// The four arms, and why each is where it is:
     ///
@@ -610,7 +611,7 @@ impl Dovi {
     ///   declaration arm — which is what keeps the emitted node's `trackType` at `"single"` and,
     ///   with `encryptionType` fixed at `"clear"`, makes the pipeline's `dv-dual-svp`
     ///   secure-video-path flag unreachable. We cannot satisfy that flag.
-    /// - **no node will be sent** (capability absent/unknown, non-HEVC output, a profile the
+    /// - **no node will be sent** (capability absent/unknown, output that is neither HEVC nor AV1, a profile the
     ///   server never named, or Profile 5 with the trigger armed) → fall back to
     ///   exactly the pre-declaration rule: refuse iff [`base_layer_unusable`](Self::base_layer_unusable).
     ///   That is what makes "keep the refusal for any case where we would not send the node" a
@@ -625,11 +626,16 @@ impl Dovi {
     ///   hint) to the `video/x-h265` caps it was already going to build. The codec string does not
     ///   change; the node is the entire difference between an IPT-PQ stream shown in wrong colours
     ///   and one the panel puts in Dolby Vision mode.
+    ///
+    ///   AV1 (Profile 10) is declared the same way, on a set whose codec table lists an AV1 decoder
+    ///   (the direct-play gate's own condition). That half is NOT from a decompile: it was measured
+    ///   on a webOS 6 set (LG C1, 2026-10-18), where an AV1 Profile 10.1 direct play put the panel
+    ///   in Dolby Vision, and is unmeasured on any other firmware.
     pub fn presentation(
         &self,
         signal: bool,
         capability: plx_platform::devcaps::dv::DvCapability,
-        video_is_hevc: bool,
+        video_carries_dv: bool,
     ) -> DvPresentation {
         if !self.present {
             return DvPresentation::NotDv;
@@ -644,7 +650,7 @@ impl Dovi {
         // it. libplayerAPIs' own platform metadata does not protect that seam, so only this app's
         // affirmative configd result may make the declaration eligible.
         let declare = capability == plx_platform::devcaps::dv::DvCapability::Supported
-            && video_is_hevc
+            && video_carries_dv
             && (signal || !self.base_layer_unusable());
         if !declare || self.profile <= 0 {
             return if self.base_layer_unusable() {
@@ -669,19 +675,19 @@ impl Dovi {
 
     /// Resolve a fresh decision from the cached platform answer and the boot-latched diagnostic
     /// signal. Call once at a route boundary; installed playback must retain the returned value.
-    pub fn presentation_now(&self, video_is_hevc: bool) -> DvPresentation {
+    pub fn presentation_now(&self, video_carries_dv: bool) -> DvPresentation {
         self.presentation(
             !dv_withheld(),
             plx_platform::devcaps::dv::capability(),
-            video_is_hevc,
+            video_carries_dv,
         )
     }
 
-    pub fn decision_now(&self, video_is_hevc: bool) -> DvDecision {
+    pub fn decision_now(&self, video_carries_dv: bool) -> DvDecision {
         let capability = plx_platform::devcaps::dv::capability();
         DvDecision {
             capability,
-            presentation: self.presentation(!dv_withheld(), capability, video_is_hevc),
+            presentation: self.presentation(!dv_withheld(), capability, video_carries_dv),
         }
     }
 }
@@ -818,6 +824,14 @@ plx_base::devtrig::latched_flag!(
     /// capability answer nor a reload re-evaluates the installed play.
     pub fn dv_withheld = "nodv";
 );
+
+/// Can a Dolby Vision declaration ride on this video codec (the source's own spelling, `"hevc"`,
+/// `"av1"`)? HEVC carries Profiles 5, 7 and 8; AV1 carries Profile 10. Anything else (an AVC
+/// Profile 9, VP9) is never declared, because the Load payload names the codec the node is read
+/// against and the pipeline has no Dolby Vision path for it.
+pub fn dv_video_codec(vcodec: &str) -> bool {
+    vcodec.eq_ignore_ascii_case("hevc") || vcodec.eq_ignore_ascii_case("av1")
+}
 
 /// Prewarm both payload diagnostics before the first frame scope. Their getters are subsequently
 /// filesystem-free even when preview or payload construction first reaches them during a frame.
@@ -3822,6 +3836,19 @@ pub fn begin_detail_for_test(adapter: &MetadataAdapter, sid: plx_plex::plex::Ser
     gen
 }
 
+/// Put the season fetch in flight (`season_loading()` true) with no worker behind it, or settle it
+/// again: the state a tab press leaves between `LoadSeason` and the landing, for a test that needs
+/// the loading half of a screen's behaviour without a network fetch.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_season_loading_for_test(adapter: &MetadataAdapter, loading: bool) {
+    use std::sync::atomic::Ordering;
+    if loading {
+        adapter.season_gen.fetch_add(1, Ordering::SeqCst);
+    } else {
+        supersede_season(adapter);
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub fn detail_generation_for_test(adapter: &MetadataAdapter) -> u32 {
     adapter.detail_gen.load(std::sync::atomic::Ordering::SeqCst)
@@ -4237,8 +4264,10 @@ pub struct AltCopy {
     /// That server's ratingKey for the item — per-server, and the whole reason the identity above
     /// it is a guid. Where OK navigates.
     pub rk: String,
-    /// Runtime in ms, for the row's sub-line. 0 = unknown, and then the sub-line is the owner
-    /// alone rather than "0 min".
+    /// Runtime in ms, for the row's read-out. 0 = none, and then the slot is left empty rather
+    /// than "0 min". Only a leaf copy has one ([`has_runtime`]): a show or season copy is 0
+    /// whatever its container's `duration` says, because that is the agent's nominal per-episode
+    /// figure and no episode's.
     pub dur_ms: i64,
     /// `Media.videoResolution` ("4k" / "1080" / "sd"), plus the stored frame size as its fallback —
     /// exactly the trio `ui::fmt::resolution` takes, so the badge in the panel and the hero's media
@@ -4507,25 +4536,47 @@ fn resolve_alt_sources(
         let handle = plx_plex::plex::server_facts(id)
             .map(|f| f.handle.clone())
             .unwrap_or_default();
-        for m in mc.metadata.iter() {
+        out.extend(alt_copies_from(id, &handle, &mc));
+    }
+    out
+}
+
+/// Does an item of this PMS `type` have a runtime of its own? A leaf does (movie, episode, clip,
+/// and any other playable file); a container (show, season, and the music/collection kinds) does
+/// not, because its `Metadata.duration` is the metadata agent's nominal per-episode figure, which
+/// matches no episode and differs per server (#814). The one predicate behind both the
+/// *Also available* rows and the About footer's Runtime.
+pub fn has_runtime(kind: &str) -> bool {
+    !matches!(kind, "show" | "season" | "artist" | "album" | "collection" | "playlist")
+}
+
+/// PURE. One source's `find_by_guid` answer projected into *Also available* rows: `handle` is the
+/// source's credit (empty = nobody to credit, so the row reads "This account").
+fn alt_copies_from(
+    id: plx_plex::plex::ServerId,
+    handle: &str,
+    mc: &plx_plex::plex::MediaContainer,
+) -> Vec<AltCopy> {
+    mc.metadata
+        .iter()
+        .map(|m| {
             let media0 = m.media.first();
-            out.push(AltCopy {
+            AltCopy {
                 sid: id,
                 library: m.library_section_title.clone(),
                 // `None` is the ABSENCE of an owner, which is what the row spells "This account";
                 // an empty handle must not become `Some("")`.
-                owner: (!handle.is_empty()).then(|| handle.clone()),
+                owner: (!handle.is_empty()).then(|| handle.to_string()),
                 rk: m.rating_key.clone(),
-                dur_ms: m.duration,
+                dur_ms: if has_runtime(&m.kind) { m.duration } else { 0 },
                 res: media0
                     .map(|x| x.video_resolution.clone())
                     .unwrap_or_default(),
                 width: media0.map(|x| x.width).unwrap_or_default(),
                 height: media0.map(|x| x.height).unwrap_or_default(),
-            });
-        }
-    }
-    out
+            }
+        })
+        .collect()
 }
 
 /// MAIN THREAD, once a frame. Runs the store's whole per-frame half — the two registry epochs, the
@@ -6082,3 +6133,45 @@ mod related_tail_tests;
 #[cfg(test)]
 #[path = "metadata_initial_season_tests.rs"]
 mod initial_season_tests;
+
+/// #814: the runtime an *Also available* row carries is a fact about one FILE, so only a leaf has
+/// one. A show container's `duration` is the metadata agent's nominal per-episode figure.
+#[cfg(test)]
+mod alt_runtime_tests {
+    use super::*;
+
+    fn copies(kind: &str) -> Vec<AltCopy> {
+        let body = format!(
+            r#"{{"MediaContainer":{{"size":1,"Metadata":[{{"ratingKey":"100","type":"{kind}",
+                "librarySectionTitle":"Library","duration":6000000}}]}}}}"#
+        );
+        let mc = serde_json::from_str::<plx_plex::plex::Envelope>(&body).unwrap().media_container;
+        alt_copies_from(plx_plex::plex::ServerId::UNSET, "", &mc)
+    }
+
+    #[test]
+    fn a_show_or_season_copy_carries_no_runtime() {
+        for kind in ["show", "season"] {
+            let c = copies(kind);
+            assert_eq!(c.len(), 1);
+            assert_eq!(c[0].dur_ms, 0, "{kind}: the container's duration is no file's runtime");
+        }
+    }
+
+    #[test]
+    fn a_leaf_copy_keeps_its_runtime() {
+        for kind in ["movie", "episode", "clip"] {
+            assert_eq!(copies(kind)[0].dur_ms, 6_000_000, "{kind}");
+        }
+    }
+
+    #[test]
+    fn only_a_playable_leaf_kind_has_a_runtime() {
+        for k in ["movie", "episode", "clip"] {
+            assert!(has_runtime(k), "{k}");
+        }
+        for k in ["show", "season", "artist", "album", "collection"] {
+            assert!(!has_runtime(k), "{k}");
+        }
+    }
+}

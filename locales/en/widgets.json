@@ -124,6 +124,10 @@
     "value": "Check for shared libraries",
     "description": "Row in the Library panel that re-checks the account for newly shared libraries. A row label in a 527px column, no wrap: keep it short."
   },
+  "widgets.source.shared_with_you": {
+    "value": "Shared with you",
+    "description": "Group header in the Library panel's +N list over the libraries other people share with this account. Their owner's handle stands on each row. A header line, no wrap: keep it short."
+  },
   "widgets.source.unauthorized": {
     "value": "Not authorized",
     "description": "Server/library availability, connection type, or library-picker action."
@@ -238,21 +242,6 @@
     "description": "Secondary caption beneath a focused media card.",
     "args": {
       "show": "str"
-    }
-  },
-  "widgets.card.season_episode": {
-    "value": "S{season} • E{episode}",
-    "description": "Secondary caption beneath a focused media card.",
-    "args": {
-      "episode": "i64",
-      "season": "i64"
-    }
-  },
-  "widgets.card.episode": {
-    "value": "E{episode}",
-    "description": "Secondary caption beneath a focused media card.",
-    "args": {
-      "episode": "i64"
     }
   },
   "widgets.failure.jail": {
@@ -672,10 +661,6 @@
     "value": "Subtitles stay on. Your Plex server will rework the video to keep them, so the picture may look a little softer.",
     "description": "Issue #266/M7. One-line note under the ENABLED Boost dialog / Normalize loudness rows when the subtitle on screen is embedded in the file — turning the toggle on makes the server re-encode the video to keep it in view. No jargon: never say burn/re-encode/transcode."
   },
-  "widgets.tracks.enh_note_dv_off": {
-    "value": "Dolby Vision turns off while this is on. The video still plays in HDR.",
-    "description": "Issue #266/M7. One-line note under the ENABLED Boost dialog / Normalize loudness rows for a Dolby Vision source whose base layer is usable — turning the toggle on plays the HDR10 base picture without the Dolby Vision declaration."
-  },
   "widgets.tracks.enh_reason_not_analyzed": {
     "value": "Not ready for this video yet. Your Plex server needs to scan its sound first.",
     "description": "Issue #266/M7. One-line reason under the DISABLED (dim) Boost dialog / Normalize loudness rows when the carried audio track has no canNormalizeLoudness fact yet."
@@ -813,6 +798,20 @@
   "widgets.verdict.forced_audio_conversion": {
     "value": "Force Direct Play is on, and this audio track needs conversion.",
     "description": "Playback failure detail while Force Direct Play is on: the selected audio track would need server conversion."
+  },
+  "widgets.verdict.forced_audio_codec": {
+    "value": "Force Direct Play is on, and {codec} audio can’t play without conversion.",
+    "description": "Playback failure detail while Force Direct Play is on: the named audio codec cannot be played directly. Used instead of the generic audio sentence when the codec is known.",
+    "args": {
+      "codec": "str"
+    }
+  },
+  "widgets.verdict.forced_audio_conversion_codec": {
+    "value": "Force Direct Play is on, and this {codec} audio track needs conversion.",
+    "description": "Playback failure detail while Force Direct Play is on: the selected audio track, of the named codec, would need server conversion. Used instead of the generic sentence when the codec is known.",
+    "args": {
+      "codec": "str"
+    }
   },
   "widgets.quality.original": {
     "value": "Original",

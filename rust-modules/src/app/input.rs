@@ -127,6 +127,11 @@ pub(crate) struct MenuPlayAwait {
     /// "this never got where it was going".
     deadline: u32,
     phase: MenuPlayPhase,
+    /// A landing opens the page instead of playing (a launch link's `open`).
+    open: bool,
+    /// A miss logs and leaves the stack as it is instead of opening the page: a launch link's key
+    /// came from outside the app, so a page for it may not exist (`app::deeplink`).
+    stay_on_miss: bool,
 }
 
 /// Which asynchronous load a [`MenuPlayAwait`] is waiting on. Both phases are polled by the one
@@ -147,7 +152,15 @@ impl MenuPlayAwait {
     /// The wait armed by a press at frame `now`: it starts on the detail request `activate_card`
     /// has just issued, and carries the same 12s ceiling for its whole life.
     fn new(sid: plx_plex::plex::ServerId, expect: String, season_index: Option<i64>, hud_ms: u32, now: u32) -> Self {
-        Self { sid, expect, season_index, hud_ms, deadline: now.wrapping_add(12_000), phase: MenuPlayPhase::Detail }
+        Self {
+            sid, expect, season_index, hud_ms, deadline: now.wrapping_add(12_000), phase: MenuPlayPhase::Detail,
+            open: false, stay_on_miss: false,
+        }
+    }
+
+    /// The wait for a launch link's item (`app::deeplink`), its detail request just issued.
+    pub(crate) fn for_link(sid: plx_plex::plex::ServerId, rk: String, open: bool, now: u32) -> Self {
+        Self { open, stay_on_miss: true, ..Self::new(sid, rk, None, plx_screens::player::input::HUD_LINGER_MS, now) }
     }
 }
 
@@ -294,7 +307,7 @@ pub(crate) unsafe fn menu_play_tick(
     let Some(wait) = menu_play_await.clone() else {
         return;
     };
-    let MenuPlayAwait { sid, ref expect, season_index, hud_ms, deadline, phase } = wait;
+    let MenuPlayAwait { sid, ref expect, season_index, hud_ms, deadline, phase, open, stay_on_miss } = wait;
     // Something else already moved the app onto the player this frame (a different press, an
     // auto-advance) — the wait is moot and must not fire a second Play on top of it.
     if super::bridge::player(pages).is_some() {
@@ -322,13 +335,17 @@ pub(crate) unsafe fn menu_play_tick(
         if loading && !expired {
             return; // still waiting — try again next frame
         }
-        *menu_play_await = None;
         if loading || !landed {
+            *menu_play_await = None;
             // ceiling, or the fetch settled as a failure — land on the page, as the detail phase does
             super::bridge::open_detail(pages, bridge, sid, expect, None, None);
-        } else {
-            play_loaded_hero(ps, pa, pages, bridge, sid, expect, hud_ms);
+            return;
         }
+        if !play_door_open(ps, pa, pages, bridge, menu_play_await, (sid, expect, stay_on_miss), expired) {
+            return;
+        }
+        *menu_play_await = None;
+        play_loaded_hero(ps, pa, pages, bridge, sid, expect, hud_ms);
         return;
     }
     let landed = bridge.metadata_view().current()
@@ -345,9 +362,19 @@ pub(crate) unsafe fn menu_play_tick(
             return; // still waiting — try again next frame
         }
         *menu_play_await = None;
+        if stay_on_miss {
+            plx_base::eventlog::log(&format!(
+                "deeplink: not opened, rk={expect} ({})", if settled { "not returned" } else { "timed out" }));
+            return;
+        }
         // nothing playable / load failed — land on the page, through the transition. `season:
         // None`: the container's own reuse rule is what keeps a re-open from stacking a second
         // copy of a page the user is already standing on (`bridge::open_detail`).
+        super::bridge::open_detail(pages, bridge, sid, expect, None, None);
+        return;
+    }
+    if open {
+        *menu_play_await = None;
         super::bridge::open_detail(pages, bridge, sid, expect, None, None);
         return;
     }
@@ -371,8 +398,40 @@ pub(crate) unsafe fn menu_play_tick(
             }
         }
     }
+    if !play_door_open(ps, pa, pages, bridge, menu_play_await, (sid, expect, stay_on_miss), expired) {
+        return;
+    }
     *menu_play_await = None;
     play_loaded_hero(ps, pa, pages, bridge, sid, expect, hud_ms);
+}
+
+/// **The play door of a [`MenuPlayAwait`]:** the landing may play only through the one door every
+/// Play from a page goes through ([`super::content::clear_engine_for_play`]), because a preview
+/// can still be letting go of the engine when the item lands. `true` means the engine is free and
+/// the caller plays. `false` means the wait goes on, still armed, and is asked again next frame;
+/// at the wait's own `deadline` (`expired`) it ends instead, as the wait's other expiries do: a
+/// link logs why and leaves the stack alone, a card press lands on the item's page.
+unsafe fn play_door_open(
+    ps: &mut plx_media::route::PlaybackSession,
+    pa: &mut plx_media::player::adapter::PlayerAdapter,
+    pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
+    bridge: &mut super::bridge::Bridge,
+    menu_play_await: &mut Option<MenuPlayAwait>,
+    (sid, expect, stay_on_miss): (plx_plex::plex::ServerId, &str, bool),
+    expired: bool,
+) -> bool {
+    if super::content::clear_engine_for_play(ps, pa, super::bridge::player(pages).is_some()) {
+        return true;
+    }
+    if expired {
+        *menu_play_await = None;
+        if stay_on_miss {
+            plx_base::eventlog::log(&format!("deeplink: not opened, rk={expect} (engine busy)"));
+        } else {
+            super::bridge::open_detail(pages, bridge, sid, expect, None, None);
+        }
+    }
+    false
 }
 
 /// The end of a settled [`MenuPlayAwait`]: play the loaded item's hero (a show's next episode, or
@@ -1447,35 +1506,13 @@ pub(crate) fn chip_activate(
     // function with the television's own keyboard up — a pointer click on the chip from inside
     // the field.
     // That path is retired (phase 7 Search cutover): `owns_input()` in `app/run.rs` now takes
-    // every Search click before it ever reaches `chip_clicked`/`chip_activate`, and the owned
+    // every Search click before it ever reaches `chip_activate`, and the owned
     // path that replaces it (`content.rs`'s `SearchReq::Account`) does not call this function at
     // all — the owned screen releases its own keyboard before emitting the request, and calling
     // `end_editing` here a second time on an instance that already dismissed it would be the
     // stale-request problem `an_old_search_keyboard_request_cannot_close_the_new_instances_keyboard`
     // guards against.
     super::bridge::open_account_menu(pages);
-}
-
-/// The bar-wearing pages, i.e. the ones with a profile chip on them at all — `BarHost::of`'s
-/// successor, and the whole of what that type was still doing once the menu became a surface.
-/// DERIVED from [`plx_ui::screen::ScreenArg::chrome`] rather than listing Home/Library/Search a second time: the
-/// chip is a control ON the shared bar, so "is there a chip to press" is "does this page wear the
-/// bar", and the two cannot drift.
-pub(crate) fn wears_the_chip(route: &AppArg) -> bool {
-    use plx_ui::screen::ScreenArg;
-    route.chrome() == plx_machine::machine::Chrome::TabBar
-}
-
-/// Did this click land on the profile chip of a screen that is WEARING the shared bar? The pointer
-/// twin of [`chip_activate`]'s key path, and the route test is the whole of what makes it safe:
-/// `widgets::CHIP_FRAME` is a constant (the chip never moves), so nothing else bounds it to the
-/// screens that actually draw one.
-pub(crate) fn chip_clicked(route: &AppArg, ev: &[u8]) -> bool {
-    if !wears_the_chip(route) {
-        return false;
-    }
-    let (mx, my) = ptr_xy(ev);
-    plx_ui::widgets::profile_chip_at(mx, my)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1562,14 +1599,15 @@ pub(crate) unsafe fn key_ok(
 /// one of the two. (It matters most at Home's root, where "what BACK would otherwise do" is hand
 /// the screen back to the television — see [`back_at_root`].)
 pub(crate) fn key_back(
-    ps: &mut plx_media::route::PlaybackSession,
+    player: &mut plx_media::player::machine::Player,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
+    repause_at: &mut i64,
     refresh_hubs: &mut bool,
     pages: &mut plx_ui::dispatch::Dispatcher<super::bridge::AppHost>,
 ) {
     if super::bridge::nav_cancel(pages) {
     } else if super::bridge::player(pages).is_some() {
-        exit_player(ps, pa, refresh_hubs, pages);
+        exit_player(player, pa, repause_at, refresh_hubs, pages);
     } else if matches!(pages.top_arg(), Some(AppArg::Content(_))) {
         // The two stacking screens, through the page transition. All three
         // halves of the pop — the outgoing page's teardown, the trail move and
