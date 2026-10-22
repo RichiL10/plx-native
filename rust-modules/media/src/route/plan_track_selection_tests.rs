@@ -972,7 +972,15 @@ fn a_selected_dca_track_is_picked_when_the_table_has_a_dts_row() {
 fn auto_and_forced_agree_on_the_dca_spelling() {
     let caps = dts_row_caps();
     assert!(audio_direct_plays_with(&caps, DirectPlayMode::Auto, "dca", 6));
-    assert!(!audio_direct_plays_with(&caps, DirectPlayMode::Auto, "dca", 8));
+    // FORK (RichiL10): Auto converts a 7.1 DTS-HD MA only under `dts_core=never`; by default the
+    // fork plays its core (`devcaps::dts_over_ceiling_for`).
+    let _serial = plx_base::testlock::serial();
+    plx_base::forkknobs::with_conf_for_test(Some("dts_core=never\n"), || {
+        assert!(!audio_direct_plays_with(&caps, DirectPlayMode::Auto, "dca", 8));
+    });
+    plx_base::forkknobs::with_conf_for_test(None, || {
+        assert!(audio_direct_plays_with(&caps, DirectPlayMode::Auto, "dca", 8), "FORK: the core lane");
+    });
     assert!(audio_direct_plays_with(&caps, DirectPlayMode::Forced, "dca", 6));
     assert!(audio_direct_plays_with(&caps, DirectPlayMode::Forced, "dca", 8));
     assert!(audio_direct_plays_with(&caps, DirectPlayMode::Forced, "DTS", 8));

@@ -1735,7 +1735,8 @@ mod tests {
             super::forced_direct_profile_for(&Caps::assumed()),
             format!(
                 "add-direct-play-profile(type=videoProfile&container=mkv,mp4&videoCodec=h264,hevc&audioCodec={}&subtitleCodec={})",
-                "aac,ac3,eac3",
+                // FORK (RichiL10): plus the fork's PCM lane (flac, pcm) and native Opus.
+                "aac,ac3,eac3,flac,pcm,opus",
                 super::DP_SUBTITLE_CODECS,
             )
         );

@@ -8494,10 +8494,13 @@ mod pre_audio_headroom_tests {
     #[test]
     fn the_audio_ceiling_holds_the_reported_film_and_not_everything() {
         let cap = crate::player::aq_caps().1 + AUDIO_AHEAD_HEADROOM as i64;
-        assert_eq!(cap, 17 * 1024 * 1024);
+        // FORK (RichiL10): the fork's 8 MiB audio base (upstream 1 MiB, so 17 MiB in total there).
+        assert_eq!(cap, (8 + 16) * 1024 * 1024);
         let bytes = |kbit: f64, secs: f64| (kbit * 1e3 / 8.0 * secs) as i64;
         assert!(bytes(768.0, 48.0) < cap, "issue #600's 48 s lead");
-        assert!(bytes(768.0, 48.0) > crate::player::aq_caps().1, "and the base cap alone cannot hold it");
+        // FORK (RichiL10): the fork's base cap alone already holds it; upstream's 1 MiB could not.
+        assert!(bytes(768.0, 48.0) < crate::player::aq_caps().1, "the fork's base cap holds the 48 s lead");
+        assert!(bytes(768.0, 48.0) > 1024 * 1024, "upstream's 1 MiB base cap could not");
         assert!(bytes(768.0, 180.0) > AUDIO_AHEAD_HEADROOM as i64 && bytes(768.0, 170.0) < AUDIO_AHEAD_HEADROOM as i64, "16 MiB is ~2.9 min of 768 kbit/s");
         assert!(bytes(6_000.0, 60.0) > cap, "a bound, not a promise");
     }

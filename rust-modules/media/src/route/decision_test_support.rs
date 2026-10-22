@@ -618,6 +618,17 @@ pub(super) fn enhancement_pms_parts(
                             (true, EnhMode::Honor(codec)) => format!(r#"{{"MediaContainer":{{"Metadata":[{{"Media":[{{"Part":[{{"decision":"transcode","Stream":[{{"streamType":1,"codec":"hevc","decision":"copy"}},{{"streamType":2,"codec":"{codec}","decision":"transcode"}}]}}]}}]}}]}}}}"#),
                             (true, EnhMode::Ignore) | (false, _) => r#"{"MediaContainer":{"Metadata":[{"Media":[{"Part":[{"decision":"transcode","Stream":[{"streamType":1,"codec":"hevc","decision":"copy"},{"streamType":2,"codec":"ac3","decision":"copy"}]}]}]}]}}"#.into(),
                         };
+                        // FORK (RichiL10): a burn can only be drawn into a re-encoded picture, so
+                        // the server's video lane says `transcode` there, as PMS does (#839's
+                        // `copied_video_dv` reads that lane). The audio lane is left as it was.
+                        let body = if line.contains("subtitles=burn") {
+                            body.replace(
+                                r#"{"streamType":1,"codec":"hevc","decision":"copy"}"#,
+                                r#"{"streamType":1,"codec":"hevc","decision":"transcode"}"#,
+                            )
+                        } else {
+                            body
+                        };
                         write_json(&mut socket, body.as_bytes());
                     } else {
                         write_json(&mut socket, EMPTY_MC);
