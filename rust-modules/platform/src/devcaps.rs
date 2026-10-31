@@ -2288,7 +2288,10 @@ mod tests {
         assert!(caps.audio_has("flac") && caps.audio_has("FLAC"));
         assert!(caps.audio_supports("flac", 1));
         assert!(caps.audio_supports("flac", 2));
-        assert!(!caps.audio_supports("flac", 6));
+        // FORK (RichiL10): upstream's answer is the one with the AC3 encode lane off; with it on
+        // (the default), 5.1 FLAC at 48 kHz is the lane's (`Caps::enc_lane_candidate`).
+        assert!(!caps.audio_supports_lanes("flac", 6, 0, true, false));
+        assert!(caps.audio_supports_lanes("flac", 6, 48_000, true, true), "FORK: the encode lane takes 5.1 FLAC at 48 kHz");
         assert!(!caps.audio_supports("flac", 0), "an unknown channel count is not admitted");
         assert_eq!(caps.audio_channels.get("flac"), Some(&PCM_MAX_CHANNELS));
         let no_row = parse(&REAL.replace("\"name\" : \"FLAC\"", "\"name\" : \"WMA\"")).unwrap();
@@ -2587,7 +2590,8 @@ mod tests {
         for codec in ["alac", "pcm", "pcm_s24le", "flac"] {
             assert!(caps.audio_has(codec), "{codec}");
             assert!(caps.audio_supports(codec, 2), "{codec}");
-            assert!(!caps.audio_supports(codec, 6), "{codec}: wider than stereo is the server's");
+            // FORK (RichiL10): upstream's answer is the one with the AC3 encode lane off (below).
+            assert!(!caps.audio_supports_lanes(codec, 6, 0, true, false), "{codec}: wider than stereo is the server's");
             assert!(!caps.audio_supports(codec, 0), "{codec}: an unknown count is not admitted");
             assert!(caps.forced_feeds_audio(codec), "{codec}");
             assert!(!Caps::assumed().forced_feeds_audio(codec), "{codec}: the assumed fallback stays what shipped");
@@ -2595,6 +2599,11 @@ mod tests {
             assert!(audio_track_fits(codec, 2, 96_000), "{codec}: 96 kHz is resampled to 48 kHz");
             assert!(!audio_track_fits(codec, 6, 96_000), "{codec}: wider than stereo is the server's at any rate");
             assert!(!audio_track_fits(codec, 6, 48_000), "{codec}");
+        }
+        // FORK (RichiL10): with the encode lane on, 5.1 FLAC and LPCM at 48 kHz play from the file as
+        // AC3; ALAC is not the lane's and stays the server's.
+        for (codec, lane) in [("flac", true), ("pcm", true), ("pcm_s24le", true), ("alac", false)] {
+            assert_eq!(caps.audio_supports_lanes(codec, 6, 48_000, true, true), lane, "FORK: {codec}");
         }
         assert_eq!(Caps::assumed().audio, "aac,ac3,eac3");
     }

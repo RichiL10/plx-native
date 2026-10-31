@@ -1553,7 +1553,7 @@ impl AudioLaneInfo {
     /// `samplingRate`, `channels`). `None` for every codec the pipeline or upstream's PCM path
     /// decodes, and for an encode-lane track at a rate the lane does not take.
     pub fn for_track(acodec: &str, rate: i64, channels: i64) -> Option<AudioLaneInfo> {
-        Self::for_track_with(plx_platform::devcaps::caps(), plx_platform::devcaps::encode_lane_on(), acodec, rate, channels)
+        Self::for_track_with(&plx_platform::devcaps::caps(), plx_platform::devcaps::encode_lane_on(), acodec, rate, channels)
     }
 
     /// [`AudioLaneInfo::for_track`] against explicit caps and `encode` knob (pure, for tests).

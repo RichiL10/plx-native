@@ -1052,7 +1052,7 @@ fn fork_cold_start_remembered_subtitle_on_a_4k_dv_film_keeps_dv_and_burns_nothin
             |env, _| {
                 env.memory = remembers_english_subtitle();
                 env.audio_enhancements = enh;
-                env.dv_capability = Some(plx_platform::devcaps::dv::DvCapability::Supported);
+                env.dv_capability = plx_platform::devcaps::dv::DvCapability::Supported;
             });
         assert!(r.plan.url.contains("start.mkv") && r.plan.contract.remux, "{enh:?}: a copy: {}", r.plan.url);
         for d in transcode_decisions(&r.requests) {
@@ -1080,7 +1080,7 @@ fn fork_cold_reresolve_carrying_a_burn_into_a_4k_dv_copy_sends_none() {
         le_due_torri_episode,
         |env, _| {
             env.audio_enhancements = plx_plex::plex::AudioEnhancements::NONE;
-            env.dv_capability = Some(plx_platform::devcaps::dv::DvCapability::Supported);
+            env.dv_capability = plx_platform::devcaps::dv::DvCapability::Supported;
             env.sub_sid = 77;
             env.sub_drawn = Some(0);
         });
