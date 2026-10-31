@@ -27,6 +27,8 @@ fn track(sid: i64, ordinal: i32, codec: &str, channels: i64, capable: bool, imme
         channels,
         can_normalize_loudness: capable,
         immersive,
+        sample_rate: 0,
+        bit_depth: 0,
     }
 }
 fn a1() -> CarriedAudio { track(11, 1, "ac3", 2, true, false) }
@@ -204,10 +206,6 @@ fn settle(ps: &mut PlaybackSession, action: &ClaimedRouteAction, tail: ClaimTail
         ClaimTail::Original(_) => true,
         ClaimTail::Rejected(_) => finish_route_action(ps, action, RouteApplyResult::Rejected),
     }
-}
-
-fn desired_audio_idx() -> i32 {
-    crate::player::SHARED.desired_audio_idx.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn decisions(requests: &[String]) -> Vec<&String> {
@@ -1453,14 +1451,14 @@ fn a_direct_played_dv_profile_5_never_rebuilds_as_a_plain_remux() {
 #[test]
 fn a_remux_that_cannot_be_asked_for_codecs_guesses_what_the_server_would_send() {
     let a = |c: &str, ch| CarriedAudio { codec: c.into(), channels: ch, ..a1() };
-    assert_eq!(remux_output_acodec(false, Some(&a("ac3", 2)), "truehd"), "ac3");
-    assert_eq!(remux_output_acodec(false, Some(&a("eac3", 6)), "truehd"), "eac3");
+    assert_eq!(remux_output_acodec(&plx_platform::devcaps::caps(), false, Some(&a("ac3", 2)), "truehd"), "ac3");
+    assert_eq!(remux_output_acodec(&plx_platform::devcaps::caps(), false, Some(&a("eac3", 6)), "truehd"), "eac3");
     // a carried track the profile cannot admit is converted to its first target
-    assert_eq!(remux_output_acodec(false, Some(&a("truehd", 8)), "truehd"), "ac3");
+    assert_eq!(remux_output_acodec(&plx_platform::devcaps::caps(), false, Some(&a("truehd", 8)), "truehd"), "ac3");
     // an enhanced remux re-encodes whatever it carries
-    assert_eq!(remux_output_acodec(true, Some(&a("eac3", 6)), "truehd"), "ac3");
+    assert_eq!(remux_output_acodec(&plx_platform::devcaps::caps(), true, Some(&a("eac3", 6)), "truehd"), "ac3");
     // no carried track: the file's own default
-    assert_eq!(remux_output_acodec(false, None, "eac3"), "eac3");
+    assert_eq!(remux_output_acodec(&plx_platform::devcaps::caps(), false, None, "eac3"), "eac3");
 }
 
 #[test]
@@ -3124,6 +3122,7 @@ fn the_stale_arms_of_the_drain_stop_their_encoder_off_the_frame_thread() {
             dv_decision: plx_data::metadata::DvDecision::NONE,
             contract: plx_plex::plex::EncodeContract::default(),
             enhancement: EnhancementOutcome::Off,
+            lanes: crate::player::recovery::Lanes { video: crate::player::recovery::Lane::Copy, audio: crate::player::recovery::Lane::Transcode },
             ticket,
             client,
             superseded: String::new(),
@@ -3249,6 +3248,7 @@ fn a_stale_landing_at_drain_time_stops_the_leaked_encoder_instead_of_installing_
             dv_decision: plx_data::metadata::DvDecision::NONE,
             contract: plx_plex::plex::EncodeContract::default(),
             enhancement: EnhancementOutcome::Off,
+            lanes: crate::player::recovery::Lanes { video: crate::player::recovery::Lane::Copy, audio: crate::player::recovery::Lane::Transcode },
             ticket: leaked_ticket,
             client: cur_client(&ps).expect("install() registered this session's server"),
             superseded: String::new(),
@@ -3651,6 +3651,53 @@ fn a_user_claim_queued_mid_automatic_flight_waits_for_the_landing_and_runs_after
     cleanup(&mut ps);
 }
 
+/// **A refused automatic Original is the reducer's fact about the HLS encoder it was asked from,
+/// and only about that encoder.** The pump reopens the retained HLS for the refusal, and the worker
+/// it spawns on the same encoder is handed the refusal, so its source gate does not probe and ask
+/// again (`player::pump::flight_tests`' reopen twin). A new encoder — an HLS rung commit, a
+/// transcode seek's rebuild, a user change — is a new admission question: its worker's gate
+/// starts fresh, so the refusal is never a give-up for the playback.
+#[test]
+fn a_refused_automatic_original_holds_the_source_gate_on_its_own_encoder_only() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = always_refusing_live();
+    restore_quality(Quality::Auto);
+    reset_player_control_for_test(&ps);
+    install(&mut ps, &live, Delivery::Hls, a1(), Some(candidate(false, a1(), None)), 0);
+    let (fresh, asked_on) = hls_abr_control(&ps).expect("the Auto HLS worker's capture");
+    assert!(!fresh.original_refused_on_this_route(), "sanity: nothing has been refused yet");
+
+    assert_eq!(
+        publish_automatic_route_intent(AutomaticRouteIntent::HlsToOriginal {
+            ticket: worker_ticket(),
+            evidence_kbps: 80_000,
+            position_ns: 60_000_000_000,
+        }),
+        AutomaticIntentResult::Accepted,
+    );
+    let action = claim_route_action().expect("the Auto worker's handoff");
+    let _frame = plx_base::task::FrameScope::enter();
+    let dispatch =
+        execute_recover_original_claim(&mut ps, &action, 60, RecoveryCause::Automatic, -1, 60_000_000_000);
+    drop(_frame);
+    assert!(matches!(dispatch, RetranscodeClaimDispatch::Pending), "a remux reaches PMS: {dispatch:?}");
+    let (_, tail, ..) = await_landing(&mut ps, "automatic Original worker never landed");
+    assert_eq!(tail, ClaimTail::Rejected(AUTO_ORIGINAL_REJECTED));
+    assert!(settle(&mut ps, &action, tail));
+
+    let (reopened, same) = hls_abr_control(&ps).expect("the retained HLS worker's capture");
+    assert_eq!(same.encoder(), asked_on.encoder(), "the refusal retained the HLS encoder");
+    assert!(reopened.original_refused_on_this_route(), "the encoder that refused Original is not asked again");
+
+    install_active_hls("next-encoder", "http://host/next.m3u8", crate::abr::Rung::P720);
+    let (moved, next) = hls_abr_control(&ps).expect("the next HLS worker's capture");
+    assert_eq!(next.encoder(), "next-encoder");
+    assert!(!moved.original_refused_on_this_route(), "a new encoder is a new admission question");
+    live.finish();
+    cleanup(&mut ps);
+}
+
 /// A direct Original needs no server round trip for an automatic recovery: the plan says so, and
 /// the pump leaves the stream playing instead of holding it for a flight that is over in a frame.
 #[test]
@@ -3677,6 +3724,52 @@ fn an_automatic_direct_original_recovery_is_a_flight_that_holds_nothing() {
     assert!(original_recovery_pending());
     let requests = live.finish();
     assert!(decisions(&requests).is_empty(), "a direct Original registers no replacement: {requests:?}");
+    cleanup(&mut ps);
+}
+
+/// **The no-Plex pipeline tier's recovery is the same flight, and it has no server to ask.** The
+/// `pipe_auto_original_slow_recover` TV case (`arm_auto_fixture`: a fixture Original, fixture HLS
+/// rungs, no Plex client) used to reach Original through the synchronous recovery; once the
+/// handoff became a claim flight (#457) its plan step also snapshotted the PMS retranscode inputs,
+/// which need a client, so the automatic direct Original — whose PMS half never touches the
+/// server — was refused as `AUTO_ORIGINAL_REJECTED` before it flew. The pump then reopened the retained HLS and the Auto
+/// worker probed, recovered and was refused again every ~10 s (13 Loads instead of 3).
+#[test]
+fn an_automatic_direct_original_recovery_needs_no_server_on_the_no_plex_fixture() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    restore_quality(Quality::Auto);
+    reset_player_control_for_test(&ps);
+    assert_eq!(
+        arm_auto_fixture(&mut ps, "http://host/clip.mp4", 8_000, "http://host/__abr", false, (1_920, 1_080)),
+        None,
+        "the fixture starts on its Original",
+    );
+    let hls = fallback_auto_to_hls_for(&mut ps, &worker_ticket(), 4_000, 11)
+        .expect("the watched fixture Original falls back to fixture HLS");
+    assert!(hls.contains("/__abr/"), "{hls}");
+    assert!(cur_client(&ps).is_none(), "the fixture has no Plex client behind it");
+    assert_eq!(
+        publish_automatic_route_intent(AutomaticRouteIntent::HlsToOriginal {
+            ticket: worker_ticket(),
+            evidence_kbps: 34_000,
+            position_ns: 24_000_000_000,
+        }),
+        AutomaticIntentResult::Accepted,
+    );
+    let action = claim_route_action().expect("the Auto worker's handoff");
+    let _frame = plx_base::task::FrameScope::enter();
+    let dispatch =
+        execute_recover_original_claim(&mut ps, &action, 24, RecoveryCause::Automatic, -1, 24_000_000_000);
+    drop(_frame);
+    assert!(
+        matches!(dispatch, RetranscodeClaimDispatch::PendingNoHold),
+        "a direct fixture Original is a flight that reaches no server, not a refusal: {dispatch:?}",
+    );
+    let (_, tail, ..) = await_landing(&mut ps, "automatic fixture Original worker never landed");
+    assert_eq!(tail, ClaimTail::Original(AutoOriginalReload::Direct));
+    assert!(original_recovery_pending());
+    assert_eq!(ps.url, "http://host/clip.mp4", "the trial opens the fixture's own Original");
     cleanup(&mut ps);
 }
 
@@ -4217,6 +4310,31 @@ fn install_truehd_remux(ps: &mut PlaybackSession, live: &Live) {
     install(ps, live, Delivery::Remux(NONE), a4(), Some(candidate(false, a4(), None)), 0);
 }
 
+/// A native-audio conversion rebuilds a DIRECT play as the plain Original remux, the same contract
+/// an undecodable audio-track pick asks for: the server copies the video and converts only the
+/// audio the TV's pipeline refused, instead of re-encoding the picture. With an embedded subtitle
+/// on screen (no one to draw it) the server must burn it, which is a re-encode by nature.
+#[test]
+fn a_direct_play_with_native_surround_audio_rebuilds_as_the_plain_remux() {
+    let mut ps = PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let live = Live::start(EnhMode::Honor("ac3"));
+    restore_quality(Quality::Auto);
+    reset_player_control_for_test(&mut ps);
+    crate::player::restore_audio_enhancements(NONE);
+    let opus = track(21, 1, "opus", 6, false, false);
+    install(&mut ps, &live, Delivery::Direct, opus.clone(), Some(candidate(true, opus.clone(), None)), 0);
+    assert!(plain_rebuild_is_remux(&ps), "a direct play with no subtitle is the Original shape");
+    assert_eq!(retranscode_contract(&ps), enhanced_remux_contract(NONE, false), "a remux, not a re-encode");
+
+    // A subtitle the server has to burn is a re-encode whichever way the audio is carried.
+    install(&mut ps, &live, Delivery::Direct, opus.clone(), Some(candidate(true, opus, Some(2))), 77);
+    assert!(!plain_rebuild_is_remux(&ps));
+    assert!(!retranscode_contract(&ps).remux, "the burn re-encodes the picture");
+    live.finish();
+    cleanup(&mut ps);
+}
+
 /// Settle a claim and let the engine confirm it, so the next edit may be claimed.
 fn land(ps: &mut PlaybackSession, action: &ClaimedRouteAction, tail: ClaimTail) {
     settle(ps, action, tail);
@@ -4425,19 +4543,20 @@ fn plain_rebuild_stays_remux_with_a_drawable_sidecar() {
 
 #[test]
 fn transcode_spec_never_names_a_subtitle_on_a_remux() {
+    let caps = plx_platform::devcaps::caps();
     let remux = enhanced_remux_contract(NONE, false);
     let spec = crate::route::plan::transcode_spec(
-        "5", "s", "s", plx_plex::plex::TranscodeOffset::Fresh, 14, 78, remux,
+        &caps, "5", 0, "s", "s", plx_plex::plex::TranscodeOffset::Fresh, 14, 78, remux,
     );
     assert_eq!(spec.subtitle_stream_id, 0, "no subtitle id rides a remux");
     assert!(spec.client_subtitles, "the app draws it, and the query says so");
     let none = crate::route::plan::transcode_spec(
-        "5", "s", "s", plx_plex::plex::TranscodeOffset::Fresh, 14, 0, remux,
+        &caps, "5", 0, "s", "s", plx_plex::plex::TranscodeOffset::Fresh, 14, 0, remux,
     );
     assert!(!none.client_subtitles, "no subtitle, nothing to say");
     // Every burn is a `remux: false` contract and keeps its id.
     let burn = crate::route::plan::transcode_spec(
-        "5", "s", "s", plx_plex::plex::TranscodeOffset::Fresh, 14, 77, enhanced_remux_contract(NONE, true),
+        &caps, "5", 0, "s", "s", plx_plex::plex::TranscodeOffset::Fresh, 14, 77, enhanced_remux_contract(NONE, true),
     );
     assert_eq!((burn.subtitle_stream_id, burn.client_subtitles), (77, false));
 }
@@ -4519,6 +4638,7 @@ fn admit_side_reader(ps: &mut PlaybackSession) {
         title: String::new(),
         ctx: String::new(),
         preview: false,
+        version: None,
     });
 }
 

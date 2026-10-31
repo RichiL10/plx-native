@@ -73,7 +73,7 @@ DUMP(off_frame_width,    offsetof(AVFrame, width))
 DUMP(off_frame_height,   offsetof(AVFrame, height))
 DUMP(off_frame_format,   offsetof(AVFrame, format))
 DUMP(off_frame_pts,      offsetof(AVFrame, pts))
-/* FORK (RichiL10): the audio lanes (ff_pcm.rs, ff_enc.rs). */
+/* FORK (RichiL10): the AC3 encode lane (ff_enc.rs). */
 DUMP(off_frame_nb_samples,  offsetof(AVFrame, nb_samples))
 DUMP(off_frame_sample_rate, offsetof(AVFrame, sample_rate))
 DUMP(off_frame_ch_layout,   offsetof(AVFrame, ch_layout))

@@ -16,11 +16,11 @@
 //!
 //! | key            | values (default first)        | consumer |
 //! |----------------|-------------------------------|----------|
-//! | `pcm_hi`       | `s32`, `s24`, `s16`           | feed: PCM sample format for sources deeper than 16 bit |
-//! | `flac`         | `pcm`, `off`                  | feed: FLAC decoded in-app to PCM, or left to the server |
-//! | `opus`         | `native`, `off`               | feed: Opus fed as-is, or left to the server |
+//! | `pcm_hi`       | (none)                        | retired in package 12: upstream's PCM path (`ff_pcm`) declares S16 or S32 itself; the key is ignored |
+//! | `flac`         | `pcm`, `off`                  | gate: FLAC decoded in-app (upstream's stereo PCM path, the fork's AC3 lane above it), or left to the server |
+//! | `opus`         | `native`, `off`               | gate: Opus fed as-is (upstream's path, stereo in Auto), or left to the server |
 //! | `dts_core`     | `auto`, `never`               | gate: DTS-HD above the TV's DTS channel ceiling plays as its core (`never` = the server converts it) |
-//! | `encode`       | `ac3`, `off`                  | feed: FLAC/PCM above the PCM lane's channels and TrueHD/MLP (48 kHz) decoded and encoded to AC3 5.1 640 kbps in-app (`off` = the server converts them) |
+//! | `encode`       | `ac3`, `off`                  | feed: FLAC/PCM above the PCM path's stereo and TrueHD/MLP (48 kHz) decoded and encoded to AC3 5.1 640 kbps in-app (`off` = the server converts them) |
 //! | `remux_dv`     | `on`, `off`                   | route: a server remux that copies the HEVC video declares the source's Dolby Vision as direct play does (`off` = declare nothing) |
 //! | `encode_audio` | `auto`, `ac3`, `eac3`         | route: what the server encodes a track the TV cannot take into, off an optical output (`auto` = E-AC3 then AC3); optical is always AC3, and so is an output the TV did not report unless this says `eac3` |
 //! | `sub_burn`     | `never4k`, `allow`            | route: never have the server burn a subtitle into a source wider than 1920 or with Dolby Vision/HDR (`allow` = upstream's burn) |

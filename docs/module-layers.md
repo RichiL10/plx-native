@@ -109,12 +109,12 @@ base
 | base | `eventlog paths task cbuf sha256 b64 spki dynlib checkpoint storage_worker fontcov surface tile hold devtrig diag::{zlib,spans,heartbeat} testlock testnet testscratch testrace` | 9k | everything |
 | machine | `ui::{machine,present,idle,landgate,landing,motion}` | 4k | 97% |
 | platform | `webos storage keymanager devcaps imgcache i18n labcfg tv` | 11k | 96% |
-| gfx | `gfx egl text img svg gpu_timer hwcnt overdraw dump` | 15k | 68% |
+| gfx | `gfx egl text rtl img svg gpu_timer hwcnt overdraw dump` | 15k | 68% |
 | net | `net stream` | 6k | 74% |
 | plex | `plex http` | 26k | 72% |
 | telemetry | `telemetry diag` (the event schema) | 16k | 64% |
 | ui | `ui` (the library) | 51k | 47% |
-| data | `stores browse metadata person collection search subsearch viewstate viewledger pms watchlist catalog` | 27k | 56% |
+| data | `stores browse metadata person collection search subsearch viewstate viewledger pms watchlist catalog hudpacks` | 27k | 56% |
 | session | `auth` | 11k | 35% |
 | media | `ff aq abr hls curlio player route` | 56k | 49% |
 | appkit | `appkit` (the player panels and the Sources row several screens draw) | 13k | 32% |
@@ -134,6 +134,12 @@ intent ledger, comparator; with `stores::watchlist`) and `catalog` (the Discover
 for the plex.tv credential, and `plex::servers` for the roster, reachability and `facts_gen`
 epochs. Neither names `net` or `media`; the screens (`watchlist`, `catalog`) and the tab pulse sit
 above them, and the application alone routes between them (`docs/watchlist.md`).
+
+`hudpacks` (the player-HUD package store, `docs/hud-plugins.md`) adds a data module and no edge. It is a
+pure machine that names only `base` (`sha256`) and `machine` (`Handled`): the HUD format lives in
+`appkit`, above data, so the store never parses a package and asks its caller for the verdict
+(`HudEffect::Validate`), and its directories, which `paths::hud_candidates()` supplies in `base`, arrive
+on an event.
 
 Four choices that were not obvious:
 
@@ -212,15 +218,18 @@ integration test and belongs to the layer that owns all of its parts (step L13).
    `ci/module-layers.ini` and this document in the same diff and say why. If the change
    re-layers a module, or declares a port, that other code already names, record those
    references as a new step's entries in the same diff, raise the pin, and add the step to the
-   migration table. L15 was added this way.
+   migration table. L15 was added this way. `ci/check-ledger-ratchet.py` then fails the PR against
+   its base branch, so a design change that re-layers is merged by the owner past that check.
 
 Adding a line to `ci/allow/layers.txt` is not a fix. Lines are added only by a design change under
 item 5, and moved when a file that already has entries is **renamed or split**: entries are keyed by
 path, so the gate reports the old key as stale and the new path as unlisted. Move the entry to the
 new path in the same diff, and do not run `--prune` first (it would delete the old key and leave the
 new one failing). A split that keeps the upward name on both sides needs one line per new file, and
-raises the pin in `tests/test_harness.py` by the same number. Since L15 the list is empty (the pin
-is 0), so a new upward reference is always a fix, and there are no entries to carry.
+raises the pin in `tests/test_harness.py` by the same number; `ci/check-ledger-ratchet.py` then
+fails the PR against its base branch, so the owner merges that split past the check. Since L15 the
+list is empty (the pin is 0), so a new upward reference is always a fix, and there are no entries
+to carry.
 
 ## The migration
 
@@ -244,7 +253,7 @@ proves the references are gone and nothing more; L15b is open.
 | **L9** telemetry owns its wire schema — **done** | 5 / 69 | The `*Class`/`Trace*` vocabulary and a new `FailureClass` are `telemetry::classes` (`player::report` re-exports them and converts through `FailureKind::class()`), clearing the error trace is a hook (`player::report::install_trace_eraser`, run at boot by `app::enter_application`, not by the first attempt: a failed preview traces without one), an incident hands over a telemetry-owned `ReadoutGlyph` that `screens::login` maps to an icon, and the consent adapter's live half is `telemetry::transition`. |
 | **L10** player and Plex-aware widgets out of ui — **done** | 38 / 511 | Part a moved `ui/{player_hud,track_menu,more_menu,info_panel,up_next,chapters_panel,timing_capsule,source_list}.rs` and `screens/player/skip_pill.rs` to the new `appkit` layer rather than `screens/` (the third choice above); part b gave `widgets`, `card_row`, `hero_logo`, `collection_tile` and `fmt` plain values (`ui::tile::TileFacts`, a raw `u16` server id, `fmt::RatingScale`), with `screens::registry::tile_facts::of` the one `PmsMovie` converter. |
 | **L11** data owns its seams — **done** | 13 / 74 | `app::bootstrap::stores` is `stores::tape`, `metadata` takes a `Playhead` value and owns `track_names`, `ContentArg` is `stores::content_arg`, `search` sizes its row window from `pms::MAX_SHELF_ITEMS`, and the `Tile` trait is the base module `tile`. |
-| **L12** media owns its lifecycle seams — **done** | 7 / 28 | The foreground-resume reducer and the transport-pause contract are `player::lifecycle` (`app::lifecycle` re-exports them), the stats switch is `player::DIAG_READOUT_ON`, `Venc::open` takes the capture socket writer as an argument, and `route` takes the HUD context line as a parameter, with the up-next still prefetch a hook the app installs. |
+| **L12** media owns its lifecycle seams — **done** | 7 / 28 | The foreground-resume machine is `player::lifecycle`, its drivers `player::foreground` and the transport-pause contract `player::transport` (`app::lifecycle` re-exports them), the stats switch is `player::DIAG_READOUT_ON`, `Venc::open` takes the capture socket writer as an argument, and `route` takes the HUD context line as a parameter, with the up-next still prefetch a hook the app installs. |
 | **L13** tests move up to the layer that owns their parts — **done** | 41 / 96 | Part a moved the auth, plex, i18n, task and fontcov tests that named upper layers to `app/` (`session_*_tests.rs`), `screens/login_text_fit_tests.rs`, `plex`, `auth::owner` and `storage::client`, and moved `fontcov`'s `Measure` impl beside the trait, with `ui::machine`'s new `BareArg`/`BareMeasure` fixtures for the rest; part b moved the data, media and ui ones to `app/` (`dispatch_return_tests.rs`, `overscan_audit_tests.rs`) and `screens/` (`plaintext_question`, `library/labels_tests.rs`, `search/tests.rs`, `player`), and rewrote two against their own layer. |
 | **L14** session-layer presentation to screens — **done** | 2 / 4 | `auth::signed_in_reason` is a private fn of `screens::login`, its only caller, with its two tests; `auth` already handed over the plain account name. |
 | **L15** the webOS port — **gate-complete** | 44 / 205 | Everything outside `[port webos]` reaches the television through the `tv` interfaces in `platform` that the port fills at boot: `tv::{device, sandbox, secure, home, toast, window}`, `devcaps::dv`, and `tv::sink::VideoSink`, a Starfish-shaped verb trait that `player::ffi::StarfishSink` and `player::ffi_host::HostSink` implement. `plex_run` is `port::plex_run`. The allowlist is empty. Not "done": the sink is not OS-neutral and the simulator is not its own port (L15b). |
@@ -281,6 +290,7 @@ published values rather than hooks: the webOS code writes them into `tv::device`
 | secure store | `tv::secure::{seal, open, remove, Sealed, Backend}` | `plex::session` |
 | storage backend | `storage::client::install_activator`, which the port calls with `webos::activate_storage_helper` | `port::plex_run` |
 | locale | `tv::system_locale` and `tv::LocaleReply`; `i18n` still owns the parse and the log lines | `i18n` |
+| sound output | `tv::sound::{output, parse_output, Reply}`, filled by `Port.sound_output` (`webos::sound_output`); a blocking read, so never on the frame thread, and asked only on a stack whose lead follows the output (`liblxa` and 2018's `audiosink_new`; `devcaps::audio_stack`; the `lgaudiosink` stack's lead does not depend on the output, and the others have none, so they never ask) | `player::threads` (through `player::engine`, which owns the lead table) |
 | window, surface, video plane, bus pump and frame probe | `tv::window` | `app::boot`, `app::run`, `app/mod.rs` |
 | home key | `tv::home::{go_home, poll, take_root_press, release_root_press}` | `app::input`, `app::run`, `app::adapters::session`, `app::lifecycle`'s tests |
 | system toast | `tv::toast::{toast, send, Identity, Outcome, Sent}` | `app::clock_notice`, `dev::scenarios::toast_probe` |
@@ -1304,9 +1314,13 @@ ready. What it taught beyond the recipe:
   `with_refused_discovery_for_test`, `fixture_with_sources`, `queue_test_landing`,
   `reverse_test_hubs`, `remove_test_item`, `land_for_test`, `publish_shelves_for_test`,
   `hold_inflight_for_test`, `REFUSE_FETCH_FOR_TEST`, `REFUSE_DISCOVERY_FOR_TEST`,
-  `seed_items_for_owner_test`, `held_detail` or `seed_two_source_table_for_owner_test`; the
+  `seed_items_for_owner_test` or `seed_two_source_table_for_owner_test`; the
   `--features test-support` control build of the same crate finds every one (1 to 8 times each),
-  and `nm` matches the seam names in 4 symbols there against 0. The ARM shipping archive built the
+  and `nm` matches the seam names in 4 symbols there against 0. (The measured list also named
+  `held_detail`, the detail fetch's held lane. It no longer exists: the detail request emits a job
+  and the app's test runner parks it, `docs/sans-io.md`. `with_refused_fetches_for_test` and
+  `REFUSE_FETCH_FOR_TEST` are gone for the same reason: Home's Hubs read is a job too, and its
+  refusal is the runner's, `#[cfg(test)]` in the app.) The ARM shipping archive built the
   way the release is (`PLX_RELEASE=1 cargo rustc --release --target arm-unknown-linux-gnueabi --lib
   --crate-type staticlib --no-default-features`) has none of them either.
 - **FFI and the final link are untouched.** The layer has no `extern "C"`, `#[link]`, `dynlib!`,
@@ -1534,7 +1548,8 @@ root), and one intra-doc link to `screens` unbracketed. The module-cycle baselin
 modules on the cycle (`app dev textinput`), 10 outside". What it taught:
 
 - **FFI and the final link: proven in the artifact, not assumed.** The crate holds every
-  `dynlib!` table of FFmpeg (`ff.rs`, four), libass (`player/ass.rs`) and the second libcurl table
+  `dynlib!` table of FFmpeg (`ff.rs`, four), libass's subtitle surface (`player/ass.rs`; the UI text
+  surface's table is `plx_gfx::rtl`) and the second libcurl table
   (`curlio.rs`), `player::ffi`'s `extern "C"` block (the Starfish/ACB verbs, 29 undefined
   symbols the Makefile's link resolves), and the two `#[no_mangle] extern "C"` callbacks
   `src/starfish.c` calls, `sf_on_event` and `acb_on_event`. All of it moved byte for byte apart from
@@ -1652,7 +1667,7 @@ doc links that named `screens`, `app`, `lab` and `focusprobe` unbracketed. What 
 
 - **One orphan-rule hit, found by the compiler.** `impl Default for SubtitleBitmaps` sat in
   `screens/player/mod.rs`, a screen's impl of `std`'s trait for a type of the layer below; across a
-  crate boundary that is E0117. It lives beside the type in `player_hud.rs` now. The `Focusable`
+  crate boundary that is E0117. It lives beside the type in `player_hud/mod.rs` now. The `Focusable`
   and `Screen` impls of the application's own types are not affected (the traits are `plx_ui`'s and
   the types the application's). `appkit` defines no `#[macro_export]` macro and the crate has no
   `env!`, `option_env!`, `include_*!` or `CARGO_MANIFEST_DIR`.

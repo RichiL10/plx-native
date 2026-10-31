@@ -23,6 +23,7 @@
 
 pub mod chapters_panel;
 pub mod hero_layout; // shared hero row geometry and meta line (Detail and the catalog page)
+pub mod hud_format; // the HUD plugin package format 1.0: descriptor table, strict parser, SVG subset checker (docs/hud-plugins.md)
 pub mod held_key; // the key-hold half of hold-to-scrub, shared by the player HUD and the trailer transport
 pub mod info_panel;
 pub mod more_menu; // the player's `…` overflow popover (holds the Stats for nerds toggle)
@@ -35,4 +36,5 @@ pub mod timing_capsule; // the on-video Subtitle Timing capsule (plan `subtitle-
 pub mod track_menu;
 pub mod watchlist_disc; // the Watchlist bookmark disc's faces, glyphs and flip (Detail's hero and Home's)
 pub mod up_next; // end-of-episode Up Next card + auto-advance countdown
+pub mod version_list; // the Play Version rows, shared by the item menu and the Detail hero's panel
 

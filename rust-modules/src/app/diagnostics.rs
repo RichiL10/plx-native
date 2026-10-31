@@ -720,7 +720,21 @@ fn pipeline_rows(ps: &plx_media::route::PlaybackSession, d: &plx_media::player::
     if applied.normalize_loudness {
         audio.push_str(" · loudness");
     }
-    v.push(Field::new(plx_platform::i18n::msg::browse_diagnostics_field_audio(), audio).fault(d.load_a == 0 && d.load_v != 0));
+    // Playback speed: the sound is decoded and time-stretched in the app and reaches the pipeline as
+    // PCM, whatever the chain above says the file carries; and the pipeline's own report of what it
+    // set up is the safety net's evidence (`player::note_speed_audio_report`), so it is shown.
+    let speed = speed_suffix(
+        plx_media::player::applied_rate_permille(),
+        plx_media::player::speed_audio_report(),
+        plx_media::player::speed_unsupported(),
+    );
+    audio.push_str(&speed);
+    let speed_bad = plx_media::player::applied_rate_permille() != plx_media::player::RATE_NORMAL
+        && plx_media::player::speed_audio_report() == Some(false);
+    v.push(
+        Field::new(plx_platform::i18n::msg::browse_diagnostics_field_audio(), audio)
+            .fault((d.load_a == 0 && d.load_v != 0) || speed_bad),
+    );
 
     // **The frame rate here is a CLAIM, and the row says whose.** `video_fps_milli` is what LG's
     // pipeline announced in its own `sourceInfo` callback, and on this set that is not a
@@ -959,6 +973,22 @@ const STALL_MS: u32 = 8_000;
 
 /// The frame count with its clock. `frames` is SEEK-scoped, so "0" has three meanings and the
 /// panel has to say which.
+/// The Audio row's playback-speed suffix: nothing at 1x on a set that takes speed; the speed, PCM
+/// and the pipeline's verdict on it during a speed session; and a note once the safety net has
+/// turned speed off on this television.
+fn speed_suffix(rate_permille: i32, report: Option<bool>, unsupported: bool) -> String {
+    if rate_permille == plx_media::player::RATE_NORMAL {
+        return if unsupported { " · speed off (PCM refused)".to_string() } else { String::new() };
+    }
+    let name = plx_media::player::rate_name(rate_permille);
+    let verdict = match report {
+        Some(true) => "PCM 48 kHz stereo ok",
+        Some(false) => "PCM NOT taken",
+        None => "PCM, waiting for the pipeline",
+    };
+    format!(" · speed {name} · {verdict}")
+}
+
 fn frames_str(d: &plx_media::player::Diag, now: u32) -> String {
     // Paused, the frame count SHOULD stop moving. Reporting that as "frozen" sends a reader after
     // a fault that is just the pause button — the verdict line already disarms its own stall clock
@@ -1628,9 +1658,9 @@ impl HeaderLayout {
 /// Two consequences, and both REMOVE code rather than adding it. The video stays visible around it,
 /// which is the point of a stats overlay you watch playback under — the first version was a
 /// full-screen opaque card that made "is anything on screen?" unanswerable while the panel was up.
-/// And it sits entirely ABOVE the transport (`player_hud::CTRL_Y`), so a pointer click can never
-/// land on the scrubber's rects THROUGH an opaque card — which was the only reason the click path
-/// needed a close-on-click arm at all.
+/// And it sits entirely ABOVE the transport (the row's top, `HudGeometry::row_anchor.top`), so a
+/// pointer click can never land on the scrubber's rects THROUGH an opaque card — which was the only
+/// reason the click path needed a close-on-click arm at all.
 impl Diagnostics {
 fn panel_width(&self) -> f32 {
     if self.idle { FIELD_COL_W + 2.0 * PAD } else { PANEL_W }
@@ -1921,6 +1951,23 @@ mod tests {
     use super::*;
     use plx_media::route::{reset_player_control_for_test, EnhTestFixture};
 
+    /// The top of the transport's control row, as the layout reports it (`HudGeometry`): the line the
+    /// panel must stay above.
+    fn transport_top() -> f32 {
+        plx_appkit::player_hud::audit_geometry().row_anchor.top
+    }
+
+    /// The Audio row's speed suffix says nothing at 1x, names the speed and the pipeline's verdict
+    /// on the PCM during a speed session, and says so once the safety net has turned speed off.
+    #[test]
+    fn the_audio_row_reports_a_speed_session() {
+        assert_eq!(speed_suffix(1000, None, false), "");
+        assert_eq!(speed_suffix(1500, Some(true), false), " · speed 1.5× · PCM 48 kHz stereo ok");
+        assert_eq!(speed_suffix(2000, Some(false), false), " · speed 2× · PCM NOT taken");
+        assert_eq!(speed_suffix(750, None, false), " · speed 0.75× · PCM, waiting for the pipeline");
+        assert_eq!(speed_suffix(1000, None, true), " · speed off (PCM refused)");
+    }
+
     /// `enhancement_test_session` registers a synthetic server AND a playback session; every
     /// caller must undo both in the same order, and the five call sites below once repeated that
     /// two-line teardown by hand. This wraps the pair as an RAII scope instead: `Deref` lets a
@@ -2057,7 +2104,7 @@ mod tests {
                     + panel.head_lines[1].len().max(1) as f32 * HEAD_LINE_H);
                 assert!(layout.fields_y >= layout.sections_y + HEAD_LINE_H);
                 assert!(plx_ui::consts::inside_safe(frame));
-                assert!(frame.y + frame.h < plx_appkit::player_hud::CTRL_Y);
+                assert!(frame.y + frame.h < transport_top());
             }
         }
     }
@@ -2075,7 +2122,7 @@ mod tests {
         for panel in [&short, &long] {
             let chart_top = panel.header_layout().fields_y + FieldList::height(RIGHT_ROWS);
             assert_eq!(panel.panel_rect().h - PAD - chart_top, FieldList::height(CHART_ROWS));
-            assert!(panel.panel_rect().y + panel.panel_rect().h < plx_appkit::player_hud::CTRL_Y);
+            assert!(panel.panel_rect().y + panel.panel_rect().h < transport_top());
         }
         assert_eq!(long.head_lines[0].concat(), long.head[0], "opaque build IDs must never lose a suffix");
     }
@@ -2630,9 +2677,9 @@ mod tests {
     fn the_panel_clears_the_transport() {
         let bottom = MARGIN + HEAD_H + FieldList::height(LEFT_ROWS) + PAD;
         assert!(
-            bottom < plx_appkit::player_hud::CTRL_Y,
+            bottom < transport_top(),
             "panel bottom {bottom} overlaps the control row at {}",
-            plx_appkit::player_hud::CTRL_Y
+            transport_top()
         );
         // through `panel_rect` itself, not a restatement of its arithmetic: its x is `MARGIN_X`
         // (the overscan side margin) while its y is `MARGIN`, and a copy here would have kept
@@ -3283,6 +3330,37 @@ mod tests {
             .and_then(|field| field.val)
             .expect("Video row");
         assert!(video.contains("declare (supported)"), "{video}");
+    }
+
+    /// Settings > Playback > Dolby Vision Off plays the base layer on a set that reports support.
+    /// The Video row still names what the set reported: `unsupported` there would be a false
+    /// statement about the television and read like a failed probe.
+    #[test]
+    fn an_off_profile_on_a_supported_set_reads_the_sets_answer_in_the_video_row() {
+        use plx_plex::plex::session::DolbyVisionMode;
+        let mut ps = plx_media::route::PlaybackSession::IDLE;
+        let dovi = plx_data::metadata::Dovi {
+            present: true,
+            profile: 8,
+            bl_compat: 1,
+            el_present: false,
+            ..plx_data::metadata::Dovi::NONE
+        };
+        let decision = plx_media::route::frozen_dv_decision(
+            DolbyVisionMode::Off,
+            plx_platform::devcaps::dv::DvCapability::Supported,
+            dovi,
+            "hevc",
+        );
+        assert!(plx_media::route::set_stream_declaration_decided_for_test(
+            &mut ps, "hevc", "eac3", 23.976, dovi, false, decision,
+        ));
+        let video = rows(&ps, &plx_media::player::Diag::default(), (0, 0, 0), 1_000)
+            .into_iter()
+            .find(|field| field.key == "Video")
+            .and_then(|field| field.val)
+            .expect("Video row");
+        assert!(video.contains("base-layer (supported)"), "{video}");
     }
 
     /// Row keys are right-aligned into a [`FIELD_KEY_W`] gutter at the dense diagnostic size, so a

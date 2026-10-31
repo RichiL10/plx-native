@@ -1144,7 +1144,7 @@ fn autoplay_arm(app: &mut App, fr: &mut Frame) {
                     snapshot.view().hub(hub).and_then(|h| h.items.get(col))
                 });
                 if let Some(pmm) = pmm {
-                    let requested = plx_media::route::request_play_movie(&mut app.player.session, app.bridge.metadata_mut(), pmm, &crate::app::playback::movie_ctx(pmm));
+                    let requested = plx_media::route::request_play_movie(&mut app.player.session, app.bridge.metadata_mut(), crate::app::playback::start_caps(), pmm, &crate::app::playback::movie_ctx(pmm), None);
                     if requested {
                         // ASYNC (phase 11): nothing here reads `metadata::current()` — the play
                         // plan came from the catalog row itself. The detail is wanted only so the
@@ -1152,7 +1152,7 @@ fn autoplay_arm(app: &mut App, fr: &mut Frame) {
                         // `install_landed_detail` calls the same `sync_now_playing` the blocking
                         // load did. So there is nothing to wait for, and no reason to spend two
                         // PMS round trips of the SDL thread on the frame that starts a playback.
-                        app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid: pmm.sid, rk: pmm.rk.to_string() });
+                        app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid: pmm.sid, rk: pmm.rk.to_string() });
                     }
                     requested
                 } else {
@@ -1244,6 +1244,8 @@ fn settings_boot_arm(app: &mut App, fr: &mut Frame) {
                 "picker-hdr-overlay" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::HdrOverlay),
                 // root → the Interface resolution picker
                 "picker-resolution" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::UiResolution),
+                "picker-instant-dpad-seeking" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::InstantDpadSeeking),
+                "picker-dolby-vision" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::DolbyVision),
                 "picker-skip-interval" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::SkipInterval),
                 "audio" => plx_screens::family::SettingsPage::AudioSubtitles,
                 _other => {
@@ -1365,7 +1367,7 @@ fn detail_arm(app: &mut App, fr: &mut Frame) -> bool {
                         return false;
                     }
                 };
-                app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
+                app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
                 #[cfg(feature = "devtriggers")]
                 plx_base::eventlog::log(&format!("plxnative-detail: rk={rk} server={} start", sid.raw()));
                 // A HARD CUT onto the page: at boot there is no outgoing screen to replace, so a
@@ -1399,6 +1401,20 @@ fn collection_arm(app: &mut App, fr: &mut Frame) -> bool {
     #[cfg(feature = "devtriggers")]
     plx_base::eventlog::log(&format!("plxnative-collection: rk={rk} server={} start", sid.raw()));
     true
+}
+
+/// `/tmp/plxnative-hud=<path>` — draw the package at that path instead of classic. Read ONCE, on the first
+/// player frame (`run::refresh_hud`); the file is read here, the bytes are compiled by the owner, and a
+/// file that does not read or compile is remembered ([`DevPackage`]), so it is neither re-read nor
+/// recompiled every frame. Without the `devtriggers` feature the trigger reads as absent.
+pub(crate) fn hud_trigger() -> plx_appkit::player_hud::loaded::DevHud {
+    use plx_appkit::player_hud::loaded::{dev_package_path, DevHud, DevPackage};
+    let Some(value) = plx_base::devtrig::read("hud") else { return DevHud::Off };
+    let Some(path) = dev_package_path(&value) else { return DevHud::Off };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string());
+    #[cfg(feature = "devtriggers")]
+    plx_base::eventlog::log(&format!("plxnative-hud: path={path} read={}", bytes.as_ref().map_or_else(|e| e.clone(), |b| format!("{} bytes", b.len()))));
+    DevHud::Package(DevPackage::new(path.to_owned(), bytes))
 }
 
 /// `/tmp/plxnative-play=<rk>` — fetch that item and play its leaf, headless. TWO frames at least,
@@ -1439,7 +1455,7 @@ fn play_arm(app: &mut App, fr: &mut Frame) -> bool {
                         return false;
                     }
                 };
-                app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
+                app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
                 #[cfg(feature = "devtriggers")]
                 plx_base::eventlog::log(&format!("plxnative-play: rk={rk} server={} request", sid.raw()));
                 app.scenarios.play_await = Some((sid, rk.to_string(), fr.now.wrapping_add(12_000)));
@@ -1493,7 +1509,7 @@ fn play_await_tick(app: &mut App, fr: &mut Frame) {
     }
     #[cfg(feature = "devtriggers")]
     plx_base::eventlog::log(&format!("plxnative-play: rk={rk} server={} start", sid.raw()));
-    if plx_media::route::request_play(&mut app.player.session, app.bridge.metadata_mut(), sid, &rk, &part, &vc, &ac, &title, "") {
+    if plx_media::route::request_play(&mut app.player.session, app.bridge.metadata_mut(), crate::app::playback::start_caps(), sid, &rk, &part, &vc, &ac, &title, "", None) {
         let resume = plx_data::metadata::resume_ns(resume_ms, dur_ms);
         crate::app::playback::start_playback(&mut app.player.session,
             &mut app.adapters.player,
@@ -1641,7 +1657,7 @@ fn menu_arm(app: &mut App, fr: &mut Frame) {
             pin_headless_hud(app, fr.now, None);
         }
         if plx_base::devtrig::flag("more") {
-            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { quality: false });
+            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { page: None });
             pin_headless_hud(app, fr.now, None);
         }
         if plx_base::devtrig::flag("info") {
@@ -1825,7 +1841,7 @@ fn moreosc_arm(app: &mut App, fr: &mut Frame) {
     app.scenarios.more_osc.last = fr.now;
     let Some(depth) = crate::app::bridge::player_overlay_mut(&mut app.pages).and_then(|s| s.more_probe()) else {
         if !crate::app::bridge::player_overlay_up(&app.pages) {
-            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { quality: false });
+            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { page: None });
             pin_headless_hud(app, fr.now, None);
         }
         return;

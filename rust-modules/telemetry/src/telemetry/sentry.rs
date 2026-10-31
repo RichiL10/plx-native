@@ -530,8 +530,9 @@ pub fn attach_user(body: &mut serde_json::Value, errors_id: Option<&str>) {
 /// One function rather than a copy per call site, so playback and any future handled event cannot
 /// drift into their own spelling of "which webOS is this" — the same reasoning `attach_user` states
 /// for the identity field. Field names match `telemetry/native.rs`'s `WEBOS_FIELDS`/
-/// `HARDWARE_FIELDS` allowlists exactly, so a handled event and a crash report read identically in
-/// Sentry's Contexts UI. Merges into whatever `contexts` object the caller already built (a
+/// `HARDWARE_FIELDS` allowlists, so a handled event and a crash report read alike in Sentry's
+/// Contexts UI. Two keys are on these events and not on a native crash (the SDK's scope, set in C,
+/// cannot carry them): the webOS `build` and the hardware `probe`. Merges into whatever `contexts` object the caller already built (a
 /// `playback` context sits beside these, not under them) rather than replacing it — and creates one
 /// if the body had none yet.
 pub fn attach_hardware_context(body: &mut serde_json::Value) {
@@ -546,6 +547,9 @@ pub fn attach_hardware_context(body: &mut serde_json::Value) {
         "type": "webos",
         "name": webos.name,
         "release": webos.release,
+        // The exact firmware build (nyx's `core_os_release`, e.g. `6.5.3-47`), which a patch within
+        // one release changes and `release` does not: what a refusal is learned against.
+        "build": webos.build,
         "codename": webos.codename,
         "api": webos.api,
     });
@@ -636,6 +640,22 @@ pub fn envelope(event_id: &str, item_type: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Frame one release-health session item. A session is not an event, so the envelope header has no
+/// `event_id` (<https://develop.sentry.dev/sdk/telemetry/sessions/>); it carries `sent_at`, the
+/// moment of sending by this clock, which lets Relay correct a television's clock drift. A clock
+/// that was never set (`sent_at_unix` is `None`) says nothing rather than a wrong time.
+pub fn session_envelope(payload: &[u8], sent_at_unix: Option<u64>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 80);
+    match sent_at_unix {
+        Some(t) => out.extend_from_slice(format!("{{\"sent_at\":\"{}\"}}\n", super::session::iso(t)).as_bytes()),
+        None => out.extend_from_slice(b"{}\n"),
+    }
+    out.extend_from_slice(format!("{{\"type\":\"session\",\"length\":{}}}\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.push(b'\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,7 +689,7 @@ mod tests {
             .expect("webos context present");
         let mut webos_keys: Vec<&str> = webos.keys().map(String::as_str).collect();
         webos_keys.sort_unstable();
-        assert_eq!(webos_keys, ["api", "codename", "name", "release", "type"]);
+        assert_eq!(webos_keys, ["api", "build", "codename", "name", "release", "type"]);
         assert_eq!(webos["type"], "webos");
         let hardware = body["contexts"]["hardware"]
             .as_object()

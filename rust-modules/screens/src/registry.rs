@@ -85,7 +85,7 @@ pub struct AccountPreferenceReply {
 }
 
 pub enum PreferenceCmd {
-    /// Capture the live profile only after admission: even session::peek can schedule storage IO.
+    /// Capture the live profile only after admission.
     Load { reply: std::sync::mpsc::Sender<AccountPreferenceReply> },
     Save {
         request: plx_plex::plex::account::PreferenceRequest,
@@ -212,18 +212,28 @@ pub enum PlayerReq {
     CommitTrack(plx_appkit::track_menu::TrackCommit),
     /// **Present one of the player's overlays directly** (restructure phase 12) — the tabs row's OK
     /// (`OverlayKind::Info`/`::Chapters`, the old `key_ok`'s `focus == 2` arm) and the failure
-    /// read-out's own recovery escape (`OverlayKind::More { quality: true }`, the old
+    /// read-out's own recovery escape (`OverlayKind::More` on its Quality page, the old
     /// `key_player_failed`'s `ChooseQuality` arm). Both used to reach
     /// `super::bridge::open_player_overlay` straight from the loop's key ladder; `PlayerScreen`
     /// may not name that function itself (§2.2), so it asks instead.
     OpenOverlay(crate::player::overlay::OverlayKind),
-    /// **OK landed on the transport's own control row** — whichever disc, the Skip pill or the Up
-    /// Next tile currently occupies it (restructure phase 12, the old `key_ok`'s `focus == 1`
-    /// arm). Arms the same tvOS press dip [`ArmInfoPress`](PlayerReq::ArmInfoPress) does; the
-    /// loop's existing commit-frame dispatch (`app/run.rs`'s `Route::Player =>
-    /// activate_player_row(...)`) is unchanged and performs whatever the row decides once the
-    /// spring-back has played.
+    /// **A pointer click landed on the transport's own control row** — whichever disc, the Skip
+    /// pill or the Up Next tile currently occupies it. Arms the same tvOS press dip
+    /// [`ArmInfoPress`](PlayerReq::ArmInfoPress) does; the loop's commit-frame dispatch
+    /// (`app/run.rs`'s `Route::Player => activate_player_row(...)`) performs whatever the row
+    /// decides once the spring-back has played, through the same performer OK reaches by
+    /// [`Command`](PlayerReq::Command) and [`StandIn`](PlayerReq::StandIn). OK on the row does not
+    /// ask this: the focus engine presses the control itself.
     ArmControlRow,
+    /// **A press on a control of the discs committed**, after the engine's tvOS dip has played
+    /// (`PressCommit`, [`PlayerScreen`](crate::player::PlayerScreen)): perform this command. The screen resolves the command of the control the
+    /// engine holds, so the app's performer (`app::playback::perform_hud_command`) never reads a
+    /// cursor. OK on the row is this; a pointer click on the row is still [`ArmControlRow`](PlayerReq::ArmControlRow).
+    Command(plx_appkit::player_hud::command::HudCommand),
+    /// **A press on a stand-in committed** — the Skip pill, or one of the Up Next pair — after the
+    /// same dip. A stand-in's meaning depends on the segment it offers, which the app resolves on
+    /// the committing frame (`app::playback::activate_ctrl_row`), so it carries no command.
+    StandIn,
     /// **Leave the player** — the one ritual the STOP key, a BACK with nothing else open, and the
     /// failure read-out's own BACK escape all perform (`exit_player`; restructure phase 12,
     /// replacing `app/run.rs`'s direct calls to it from the player's own key arms).
@@ -441,7 +451,8 @@ pub enum ItemMenuKind {
     /// The detail page's episode filmstrip. `mark` is resolved by the page through the same
     /// `ep_state` that draws the still's own state line, so the tile and the menu opened on it
     /// cannot describe one episode two ways.
-    Episode { mark: plx_ui::widgets::PosterMark },
+    /// `versions` is the episode's (two or more for the Play Version row), captured at open.
+    Episode { mark: plx_ui::widgets::PosterMark, versions: Vec<plx_data::pms::MediaVersion> },
     /// The detail page's season tabs. `show_rk` is the show the page has loaded and `index` the
     /// tab's season number (`Season::index`): together the address of the season's episodes, which
     /// is all a season-scoped write reaches them by (`viewstate::Scope::Season`).
@@ -462,7 +473,7 @@ impl PartialEq for ItemMenuKind {
         match (self, other) {
             (Self::Card { row: a, from_deck: da }, Self::Card { row: b, from_deck: db }) =>
                 da == db && a.sid == b.sid && a.rk == b.rk && a.kind == b.kind,
-            (Self::Episode { mark: a }, Self::Episode { mark: b }) => a == b,
+            (Self::Episode { mark: a, .. }, Self::Episode { mark: b, .. }) => a == b,
             (Self::Season { mark: a, show_rk: sa, index: ia }, Self::Season { mark: b, show_rk: sb, index: ib }) =>
                 a == b && sa == sb && ia == ib,
             (Self::Catalog { state: a }, Self::Catalog { state: b }) => a == b,
@@ -487,7 +498,7 @@ impl plx_machine::machine::LogicalState for ItemMenuArg {
         c.u32(u32::from(self.sid.raw())).str(&self.rk);
         match &self.kind {
             ItemMenuKind::Card { row, from_deck } => { c.u32(0).bool(*from_deck).u32(row.kind as u32); }
-            ItemMenuKind::Episode { mark } => { c.u32(1).u32(*mark as u32); }
+            ItemMenuKind::Episode { mark, .. } => { c.u32(1).u32(*mark as u32); }
             ItemMenuKind::Season { mark, show_rk, index } => { c.u32(2).u32(*mark as u32).str(show_rk).u64(*index as u64); }
             ItemMenuKind::Catalog { state } => { c.u32(3).u32(*state as u32); }
         }
@@ -1130,6 +1141,9 @@ pub enum ContentPanel {
     /// *Also available* (`screens::alt_sources`), anchored to the drawn rect of the pill that
     /// opened it — bit-preserving, so a canonical argument holds it without float equality.
     AltSources { anchor: [u32; 4] },
+    /// *Play Version* (`screens::versions_panel`), anchored to the drawn rect of the disc that
+    /// opened it, as [`Self::AltSources`] is to its pill.
+    Versions { anchor: [u32; 4] },
     /// *Track information* (`screens::tracks_panel`), opened at 1-based `page`. Every interactive
     /// opening passes 1; `/tmp/plxnative-tracks=<n>` is the only caller that does not, and it is
     /// what makes a headless capture of page 2 possible at all.
@@ -1181,6 +1195,18 @@ impl ContentPanel {
                     }),
                 )
             }
+            Self::Versions { anchor } => {
+                let (sid, rk) = subject?;
+                (
+                    Style::Compact,
+                    AppArg::VersionsPanel(crate::versions_panel::VersionsArg {
+                        host,
+                        sid,
+                        rk: rk.to_string(),
+                        anchor,
+                    }),
+                )
+            }
             Self::Tracks { page } => (
                 Style::Alert,
                 AppArg::TracksPanel(crate::tracks_panel::TracksPanelArg { page }),
@@ -1210,12 +1236,18 @@ pub enum PlayIntent {
         acodec: String,
         title: String,
         context: String,
+        /// The version picked on the Play Version panel, `None` for the default (`Media[0]`).
+        version: Option<plx_plex::plex::MediaId>,
     },
     /// The alternative source the page had selected (`route::request_play_movie`). Owned rather
     /// than a `&'static` catalog borrow: it is held inside `PageAction`/`AppFx` across a frame
     /// boundary, and once Detail's `selected` becomes an owned per-page snapshot (rather than a
     /// process-wide catalog read) there is no `'static` row left to borrow.
-    Movie(plx_data::pms::PmsMovie),
+    Movie {
+        item: plx_data::pms::PmsMovie,
+        /// As [`PlayIntent::Item`]'s.
+        version: Option<plx_plex::plex::MediaId>,
+    },
 }
 
 pub trait ContentLike: AppLike<Memory = PageMemory> {}
@@ -1287,6 +1319,20 @@ pub trait LibraryLike: AppLike<Memory = PageMemory> + Sized {
     fn collections_count(_cx: &Cx<'_, Self>, _section: usize) -> Option<Result<u32, Forbidden>> {
         None
     }
+
+    /// **Today's calendar date** in the viewer's time zone, `[year, month, day]`: an INPUT the
+    /// Library words its date values by ("Today", "Yesterday", "27 Oct" this year, "Oct 2024" any
+    /// other), `None` when the host has none (every date then reads as month and year). A screen
+    /// reads no clock and fetches no date: the application's loop publishes it once per frame (it
+    /// reads the platform's calendar date at most once a minute, `app::clock::today`) and a screen
+    /// only receives the answer through its views, the way a frame's time arrives on a `Tick` and
+    /// the playback session on the frame's publication. The caption cache keys its labels on it, so
+    /// they rebuild when the day turns.
+    ///
+    /// CONTRACT FREEZE: a provided method so every existing host compiles.
+    fn today(_cx: &Cx<'_, Self>) -> Option<[i32; 3]> {
+        None
+    }
 }
 
 /// The server refused the collections listing (HTTP 401/403): the answer is final for the identity
@@ -1351,6 +1397,9 @@ pub enum AppMsg {
     /// the destination and the PAGE navigates, which is `LibraryMenu`'s shape (`LibrarySelect`) and
     /// what keeps "what a press means on the Detail page" in one place instead of two.
     AltSourceOpen(ContentArg),
+    /// The *Play Version* surface committed a row: play that version of the page's item, as its
+    /// Play pill would (resuming). The surface names the version and the page plays it.
+    PlayVersion(plx_plex::plex::MediaId),
 }
 
 /// What the consent machine is told (§2.3): a person's answer to both questions at once.
@@ -1777,6 +1826,9 @@ pub enum AppArg {
     /// rect of the pill it hangs off — is on the argument, `LibraryMenuArg`'s shape and for the
     /// same reason: the entry outlives any one frame's idea of where that pill was.
     AltSources(crate::alt_sources::AltSourcesArg),
+    /// The Detail page's *Play Version* list (§6.2's page-owned panels), anchored to the hero disc
+    /// that opened it, [`Self::AltSources`]'s shape.
+    VersionsPanel(crate::versions_panel::VersionsArg),
     /// The Detail page's *Track information* sheet (§6.2's page-owned panels). It carries only the
     /// 1-based PAGE the sheet opens at — a boot address like `Settings`'s root, not an identity —
     /// because the sheet describes `metadata::current()` and the host it is presented over is the
@@ -1851,8 +1903,9 @@ impl AppArg {
 }
 
 pub const ARG_SHAPE: &str = "AppArg{Login,Profiles,Onboard,Home,Library,LibraryCollections{section:u32},LibraryRecommended{section:u32},Search,Watchlist,Player,Content:{Detail{sid:u32,rk:str},Person{sid:u32,key:str,guid:str,name:str,thumb:str},Filmography{sid:u32,key:str},Collection{sid:u32,rk:str,sec:i64,tag:i64,name:str},Catalog{hex:str}},Settings:SettingsPage{Root,Playback,AudioSubtitles,Favourites,Privacy,Legal,About,Document(u8),Preview(u8),ConsentStage(u8),Language,Contribute},FirstRunConsent(u8),LibraryMenu{host:u32,target:{epoch:u32,sid:u32,section:u64},kind:u32,anchor:[u32;4]},\
-     PlayerOverlay{Tracks(tab:i32),Info,Chapters,More(quality:bool)},\
+     PlayerOverlay{Tracks(tab:i32),Info,Chapters,More(page:u8)},\
      AltSources{host:u32,sid:u32,rk:str,anchor:[u32;4]},\
+     VersionsPanel{host:u32,sid:u32,rk:str,anchor:[u32;4]},\
      TracksPanel{page:i32},AboutPanel,PersonBio,CollectionAbout,AccountMenu,\
      ItemMenu{sid:u32,rk:str,kind:{Card{from_deck:bool,type:u32},Episode{mark:u32},Season{mark:u32},Catalog{state:u32}},\
      host:u32,focus:Option<{entry:u32,elem:u32}>,anchor:[u32;4],loaded_episode:bool,from_home:bool,catalog:Option<{guid:str}>},\
@@ -1879,6 +1932,8 @@ impl LogicalState for AppArg {
             Self::ItemMenu(arg) => { c.u32(9); arg.write(c); }
             // 13, after the About/Bio/Collection sheets' 10-12: allocated forward.
             Self::WatchlistMenu(arg) => { c.u32(13); arg.write(c); }
+            // 14, forward of the Watchlist menu's 13.
+            Self::VersionsPanel(arg) => { c.u32(14); arg.write(c); }
             // The seven PAGE variants keep the canon bytes `Legacy(Route)` wrote — a `0` tag and
             // then the route's own — so a recording taken before the fold and one taken after are
             // byte-comparable at every page frame. Only the SHAPE STRING moved, which is what the
@@ -1927,6 +1982,7 @@ impl plx_ui::screen::ScreenArg for AppArg {
             | AppArg::WatchlistMenu(_)
             | AppArg::PlayerOverlay(_)
             | AppArg::AltSources(_)
+            | AppArg::VersionsPanel(_)
             | AppArg::TracksPanel(_)
             | AppArg::AboutPanel
             | AppArg::PersonBio
@@ -1983,6 +2039,8 @@ impl plx_ui::screen::ScreenArg for AppArg {
             AppArg::Content(ContentArg::Collection(_)) => page_id::COLLECTION.0,
             // 27, forward of the Watchlist menu's 26: the catalog page (plan W6).
             AppArg::Content(ContentArg::Catalog { .. }) => 27,
+            // 30, forward of the Recommended page's 29.
+            AppArg::VersionsPanel(_) => 30,
         })
     }
     fn title(&self) -> Option<&str> {
@@ -2049,6 +2107,18 @@ pub struct AppMounter {
     /// taken before a blocking resolve, so a load longer than the 4.5 s linger expired the HUD
     /// before it was ever drawn and the user got a blank screen instead of a transport.
     pub player_hud_ms: Option<u32>,
+    /// **The rect the NEXT player menu hangs from**: the compiled package's anchor for the opener that asked
+    /// (`PlayerScreen::menu_anchor`), stamped by the app at the press and consumed by the overlay's mount,
+    /// a seed like `player_hud_ms` and for the same reason: the canonical `PlayerOverlayArg` is the panel's
+    /// KIND, so a rect of floats cannot ride on it. `None` mounts the menu at its own default.
+    pub player_menu_anchor: Option<plx_ui::Rect>,
+    /// **The compiled HUD the NEXT player instance is constructed with** (`PlayerScreen::new`'s argument):
+    /// compiled by the app once per process (at boot, outside any frame; a controlled run or a dev package
+    /// compiles on its first player frame instead), and handed to the mount the way the seeds above are.
+    /// Cloned, not consumed: every player instance draws from the app's current compile. The mount never compiles, reads no registry and holds no fallback of its own; a
+    /// mounter nothing seeded (a controlled run, which compiles nothing outside a frame and never reaches the
+    /// player) hands the page `Compiled::default()`, which has no state for any frame.
+    pub player_compiled: std::sync::Arc<plx_appkit::hud_format::compile::Compiled>,
 }
 
 /// **The one `mount` match** (spec §2.1) — the whole of what "add a screen" costs, in the module
@@ -2081,13 +2151,25 @@ where
             AppArg::ItemMenu(arg) => Box::new(
                 crate::item_menu::ItemMenuScreen::new(entry, arg.clone()).with_watchlist(arg.watchlist)),
             AppArg::WatchlistMenu(arg) => Box::new(crate::watchlist::menu::WatchlistMenuScreen::new(entry, *arg)),
-            AppArg::PlayerOverlay(arg) => Box::new(
-                crate::player::overlay::PlayerOverlayScreen::new_with(
-                    H::session(cx), H::metadata(cx), entry, arg.kind, H::subtitle_search(cx).is_some()),
-            ),
+            AppArg::PlayerOverlay(arg) => {
+                let offer_search = H::subtitle_search(cx).is_some();
+                Box::new(match self.player_menu_anchor.take() {
+                    Some(anchor) => crate::player::overlay::PlayerOverlayScreen::new_anchored(
+                        H::session(cx), H::metadata(cx), entry, arg.kind, offer_search, anchor),
+                    None => crate::player::overlay::PlayerOverlayScreen::new_with(
+                        H::session(cx), H::metadata(cx), entry, arg.kind, offer_search),
+                })
+            }
             AppArg::AltSources(arg) => Box::new(
                 crate::alt_sources::AltSourcesScreen::new(entry, arg.clone(), H::metadata(cx)),
             ),
+            AppArg::VersionsPanel(arg) => {
+                let versions = H::metadata(cx)
+                    .current()
+                    .filter(|d| plx_plex::plex::same_item((d.sid, d.rk.as_str()), (arg.sid, arg.rk.as_str())))
+                    .map_or(&[][..], crate::detail::hero_versions);
+                Box::new(crate::versions_panel::VersionsPanelScreen::new(entry, arg.clone(), versions))
+            }
             AppArg::TracksPanel(arg) => Box::new(
                 crate::tracks_panel::TracksPanelScreen::new(entry, *arg),
             ),
@@ -2194,7 +2276,7 @@ where
             // instant it mounts (`AppMounter::player_hud_ms`), never from the keypress that asked
             // for the playback.
             AppArg::Player => {
-                let mut page = crate::player::PlayerScreen::new(entry);
+                let mut page = crate::player::PlayerScreen::new(entry, std::sync::Arc::clone(&self.player_compiled));
                 // **Where BACK, Stop and EOS land** (§5.1). Captured at the MOUNT, from the page
                 // that was on top when the push was asked for — never read live, because an
                 // overlay opening on this page's own stack changes the input owner and must not
@@ -2280,6 +2362,12 @@ pub fn every_surface_arg() -> Vec<AppArg> {
             rk: "1".into(),
             anchor: [0; 4],
         }),
+        AppArg::VersionsPanel(crate::versions_panel::VersionsArg {
+            host: plx_machine::machine::InstanceId(1),
+            sid: plx_plex::plex::ServerId::UNSET,
+            rk: "1".into(),
+            anchor: [0; 4],
+        }),
         AppArg::TracksPanel(crate::tracks_panel::TracksPanelArg { page: 1 }),
         AppArg::AboutPanel,
         AppArg::PersonBio,
@@ -2296,6 +2384,7 @@ pub fn every_surface_arg() -> Vec<AppArg> {
             | AppArg::ItemMenu(_)
             | AppArg::WatchlistMenu(_)
             | AppArg::AltSources(_)
+            | AppArg::VersionsPanel(_)
             | AppArg::TracksPanel(_)
             | AppArg::AboutPanel
             | AppArg::PersonBio
@@ -2379,6 +2468,7 @@ pub const SCREEN_SHAPES: &[&str] = &[
     crate::watchlist::page::WatchlistScreen::SHAPE,
     crate::watchlist::menu::SHAPE,
     crate::catalog::CatalogScreen::SHAPE,
+    crate::versions_panel::SHAPE,
 ];
 
 /// The pin over [`SCREEN_SHAPES`] — bump it in the same edit that adds an entry, and say why.
@@ -2552,7 +2642,27 @@ pub const SCREEN_SHAPES: &[&str] = &[
 // `(row:u32,sp:..,card:Option<u32>)`, in write order; the Collection and Watchlist grids name
 // `bands` symbolically, so their shape strings did not change. One bump; the three replay fixtures
 // were re-recorded against it; the previous pin was 0x0803_2f8d_c828_6d70.
-const SCREEN_SHAPES_PIN: u64 = 0x6b71_df9e_04db_2b76;
+// Player two-press BACK while busy: `PlayerScreen`'s `hud` gains `exit_armed` (a BACK hid the
+// transport while the pipeline was busy, so the hide cannot show) and `back_leaves_at_press` (that
+// arming, sampled before the press un-dismisses), both after `visible_at_press` in the canon and
+// the shape string. One bump; the three replay fixtures were re-recorded against it; the previous
+// pin was 0x6b71_df9e_04db_2b76.
+// Play Version: `item_menu::SHAPE`'s `Action` gains `ChooseVersion` (tag 12) and `PlayVersion`
+// (tag 13, with its `media:u64` id); `ARG_SHAPE` gains `VersionsPanel{host,sid,rk,anchor}` and
+// `screens::versions_panel::SHAPE` is appended. One bump; the three replay fixtures were
+// re-recorded against it; the previous pin was 0x209b_8063_1907_d7c8.
+// Immediate jump state adds SeekBurst target/time and the pending FF/REW tap flag.
+// The independent settings also update the Preferences and Picker state versions.
+// Previous pin: 0x3cf2_5b06_5ed9_8faa. Re-record the incompatible anchors through plxnative-rec.
+// HUD commands (PR3): `PlayerOverlay::More` names the page it opens on, `More(page:u8)` (0 the
+// root, 1 Quality, 2 Speed) where it carried `More(quality:bool)`, so the Speed page can be
+// addressed. One bump; the three replay fixtures were re-recorded against it; the previous pin was
+// 0x9425_f33f_3f53_6aa5.
+// Skip / Up Next offer dismissal: `PlayerScreen`'s `hud` gains `dismissed_offer` (the segment
+// BACK dismissed), after `last_offer` in the canon and the shape string. One bump; the census is
+// part of the replay state fingerprint even though the anchors never mount the player, so all
+// three recordings were re-recorded against it.
+const SCREEN_SHAPES_PIN: u64 = 0xe208_abdc_a1df_2158;
 
 #[cfg(test)]
 mod arg_tests {
@@ -2854,3 +2964,5 @@ mod compaction_tests {
         assert_eq!(table, vec![1, 2, 3]);
     }
 }
+
+pub(crate) mod sort_info;

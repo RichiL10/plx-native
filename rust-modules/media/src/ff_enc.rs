@@ -7,7 +7,7 @@
 //! demux thread:
 //!
 //! 1. decodes the track with the bundled FFmpeg (`flac`, `truehd`, `mlp`; native `A_PCM/*` is
-//!    read as-is through the PCM lane's [`SrcFmt`]);
+//!    read as-is through [`SrcFmt`]);
 //! 2. folds it to 5.1(side) — FL FR FC LFE SL SR — by channel ROLE, in Q15 fixed point with
 //!    saturation ([`fold_matrix`], [`fold`]);
 //! 3. cuts exact 1536-sample frames with a timestamped FIFO ([`Fifo`]) and encodes them with
@@ -18,10 +18,73 @@
 //!
 //! Integer arithmetic only on the fold (the build is soft-float ARM, and `ac3_fixed` is the
 //! integer encoder); no resampler, so the lane takes 48 kHz sources only and the route leaves
-//! anything else with the server (`devcaps::Caps::audio_lane`).
+//! anything else with the server (`devcaps::Caps::enc_lane_fits`).
 
-use super::pcm::SrcFmt;
 use super::*;
+
+/// FORK (RichiL10): a raw PCM sample layout the lane reads (Matroska/MOV `A_PCM/*`), and the
+/// sample format of a decoded frame. Moved here from the fork's old PCM lane, which upstream's
+/// `ff_pcm` replaced: the encode lane is its only user now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SrcFmt {
+    S16Le,
+    S16Be,
+    S24Le,
+    S24Be,
+    S32Le,
+    S32Be,
+    F32Le,
+    F32Be,
+}
+
+impl SrcFmt {
+    pub(super) fn bytes(self) -> usize {
+        match self {
+            SrcFmt::S16Le | SrcFmt::S16Be => 2,
+            SrcFmt::S24Le | SrcFmt::S24Be => 3,
+            _ => 4,
+        }
+    }
+
+    /// The Matroska/MOV PCM flavours FFmpeg names (`avcodec_get_name`, stable across majors).
+    pub(super) fn from_pcm_codec(name: &str) -> Option<SrcFmt> {
+        Some(match name {
+            "pcm_s16le" => SrcFmt::S16Le,
+            "pcm_s16be" => SrcFmt::S16Be,
+            "pcm_s24le" => SrcFmt::S24Le,
+            "pcm_s24be" => SrcFmt::S24Be,
+            "pcm_s32le" => SrcFmt::S32Le,
+            "pcm_s32be" => SrcFmt::S32Be,
+            "pcm_f32le" => SrcFmt::F32Le,
+            "pcm_f32be" => SrcFmt::F32Be,
+            _ => return None,
+        })
+    }
+
+    /// One sample as a full-scale (MSB-aligned) 32-bit value.
+    #[inline]
+    pub(super) fn read(self, b: &[u8]) -> i32 {
+        match self {
+            SrcFmt::S16Le => i32::from(i16::from_le_bytes([b[0], b[1]])) << 16,
+            SrcFmt::S16Be => i32::from(i16::from_be_bytes([b[0], b[1]])) << 16,
+            SrcFmt::S24Le => i32::from_le_bytes([0, b[0], b[1], b[2]]),
+            SrcFmt::S24Be => i32::from_be_bytes([b[0], b[1], b[2], 0]),
+            SrcFmt::S32Le => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            SrcFmt::S32Be => i32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            SrcFmt::F32Le => float_to_s32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            SrcFmt::F32Be => float_to_s32(f32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+        }
+    }
+}
+
+#[inline]
+fn float_to_s32(f: f32) -> i32 {
+    if f.is_nan() {
+        return 0;
+    }
+    let v = f64::from(f.clamp(-1.0, 1.0)) * 2_147_483_647.0;
+    v.round() as i32
+}
 
 /// The encode lane's fixed output: AC3 5.1(side), 48 kHz, 640 kbps.
 pub const ENC_RATE: u32 = 48_000;
@@ -37,7 +100,7 @@ const JUMP_NS: i64 = 100_000_000;
 
 /// What the Load declared for the encode lane: the source's channel count, as PMS reported it
 /// (the lane folds whatever the decoder actually returns). Published by the engine BEFORE the
-/// demux thread exists, read once by it at open — the same contract as `pcm::declare`.
+/// demux thread exists, read once by it at open (`player::engine::start_bufferfeed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncSpec {
     pub channels: u32,

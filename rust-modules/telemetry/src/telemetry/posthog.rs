@@ -280,6 +280,13 @@ mod tests {
         vec![
             DiagEvent::AppLaunch,
             DiagEvent::RouteEntered { screen: "home" },
+            DiagEvent::RouteLeft {
+                screen: "home",
+                slow_frames: "1-5%",
+                frozen_frames: "0",
+                hang: "<1",
+                dead_presses: "0",
+            },
             DiagEvent::SignInStarted,
             DiagEvent::SignInCompleted,
             DiagEvent::SignInFailed {
@@ -303,6 +310,10 @@ mod tests {
                 playback_id: 7,
                 mode: "direct",
                 kind: "network",
+                video: "h264",
+                audio: "ac3",
+                pipeline_error: "0",
+                refusal: "none",
             },
             DiagEvent::PlaybackCancelled {
                 playback_id: 7,
@@ -442,6 +453,32 @@ mod tests {
         assert_eq!(s["properties"][ANON], serde_json::json!(false));
     }
 
+    /// `route.left` carries its screen and the four closed classes under their own names, and no
+    /// number: every property it adds is a string from the registry's domain.
+    #[test]
+    fn route_left_carries_only_its_closed_classes() {
+        let s = parse(&single(
+            "phc_k",
+            "id1",
+            DiagEvent::RouteLeft {
+                screen: "detail",
+                slow_frames: "5-20%",
+                frozen_frames: "2-3",
+                hang: "10+",
+                dead_presses: "2+",
+            },
+            "test",
+            Some("2026-08-29T00:00:00Z"),
+        ));
+        assert_eq!(s["event"], "route.left");
+        let p = &s["properties"];
+        assert_eq!(
+            (p["screen"].as_str(), p["slow_frames"].as_str(), p["frozen_frames"].as_str(),
+             p["hang"].as_str(), p["dead_presses"].as_str()),
+            (Some("detail"), Some("5-20%"), Some("2-3"), Some("10+"), Some("2+"))
+        );
+    }
+
     /// The event name in the body is the SCHEMA's name, not a variant name stringified — the two
     /// have drifted in other projects, and `PRIVACY.md` documents the schema's.
     #[test]
@@ -509,6 +546,10 @@ mod tests {
                 playback_id: 7,
                 mode: "direct",
                 kind: kind.code(),
+                video: "h264",
+                audio: "dts",
+                pipeline_error: "601",
+                refusal: "async",
             };
             let envelope = crate::diag::schema::UsageEnvelope::capture(event, 0, "session");
             let body = parse(&captured("phc_k", "id1", &envelope, "test"));

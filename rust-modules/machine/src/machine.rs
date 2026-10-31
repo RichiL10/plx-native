@@ -2,16 +2,6 @@
 //! bundle a generic library is compiled against, the newtypes, `Machine` + `Cx` + `Effects`, the
 //! effect vocabulary `Fx`, input events, navigation ops, addressing, and the `LogicalState` /
 //! `Canon` pair every hashed state implements.
-//!
-//! **Phase 2-i — the contract spike.** This module and its siblings (`screen`, `present`,
-//! `landing`, `tex`, `frame`, `dispatch`) are a COMPILING host-only skeleton; nothing in the
-//! product calls them until phase 2 replaces `app/run.rs`'s loop with `dispatch`. They exist so
-//! the boundaries are proven to COMPOSE against the layer rule (§2.1: this module names no
-//! application type, no widget, no engine, no screen — `stores/` will reach `ui::` through this
-//! module alone) before any real code moves. Every type here is what the spec names; where the
-//! spike narrows one (such as a `Timer` with no owner registry) the doc
-//! on it says so.
-#![allow(dead_code)] // phase 2-i: the contract has no consumer until phase 2 (spec §13)
 
 use std::ffi::CStr;
 use std::hash::Hash;
@@ -208,6 +198,14 @@ pub trait Measure {
     /// replay and recording use the supplied metrics on every call, including missing-key checks.
     fn fit_line(&self, s: &str, budget: f32, sz: i32, bold: bool) -> std::rc::Rc<CStr> {
         fit_line_by(self, s, budget, sz, bold)
+    }
+
+    /// A fitted drawable and its advance. Native measurement caches both; replay keeps querying
+    /// its supplied metrics. Use when an inline mark must be centred together with the text.
+    fn fit_line_measured(&self, s: &str, budget: f32, sz: i32, bold: bool) -> (std::rc::Rc<CStr>, f32) {
+        let run = self.fit_line(s, budget, sz, bold);
+        let width = self.width(&run, sz, bold);
+        (run, width)
     }
 
     /// `width` for a borrowed `&str` (spec §4.3, phase 12 D4): builds the transient `CString` so
@@ -682,6 +680,7 @@ impl<K> InputEvent<K> {
             }
             InputKind::PointerHidden => { c.u32(6); }
             InputKind::SystemKeyboard(up) => { c.u32(7).bool(*up); }
+            InputKind::Pan { dx, x, y } => { c.u32(8).f32(*dx).f32(*x).f32(*y); }
         }
     }
 }
@@ -744,6 +743,14 @@ pub enum InputKind<K> {
     },
     Wheel {
         dy: f32,
+    },
+    /// **A sideways glide of the row under the pointer** (the application's pointer edge glide):
+    /// `dx` px (+ shows more on the right), for whatever scrolls sideways at screen `(x, y)`. A
+    /// page with nothing there ignores it.
+    Pan {
+        dx: f32,
+        x: f32,
+        y: f32,
     },
     Text(TextEdit),
     PointerHidden,

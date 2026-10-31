@@ -73,6 +73,10 @@ pub enum PickerKind {
     ForcedSubtitles,
     /// Settings > System > Interface resolution (install-wide; pushed from the Settings root).
     UiResolution,
+    /// Optional immediate D-pad jumps.
+    InstantDpadSeeking,
+    /// Manual Dolby Vision override (Auto / Off).
+    DolbyVision,
 }
 
 impl SettingsPage {
@@ -92,7 +96,7 @@ impl PickerKind {
     /// The page that lists this field (its picker is pushed from there and returns there).
     pub fn parent(self) -> SettingsPage {
         match self {
-            PickerKind::Quality | PickerKind::DirectPlay | PickerKind::SubtitleSize | PickerKind::SubtitlePosition | PickerKind::HdrOverlay | PickerKind::NextEpisode | PickerKind::DeckPress | PickerKind::SkipInterval => SettingsPage::Playback,
+            PickerKind::Quality | PickerKind::DirectPlay | PickerKind::SubtitleSize | PickerKind::SubtitlePosition | PickerKind::HdrOverlay | PickerKind::NextEpisode | PickerKind::DeckPress | PickerKind::SkipInterval | PickerKind::InstantDpadSeeking | PickerKind::DolbyVision => SettingsPage::Playback,
             PickerKind::AudioLanguage | PickerKind::SubtitleMode | PickerKind::SubtitleLanguage | PickerKind::ForcedSubtitles => SettingsPage::AudioSubtitles,
             PickerKind::UiResolution => SettingsPage::Root,
         }

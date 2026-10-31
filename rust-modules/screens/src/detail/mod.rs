@@ -183,8 +183,9 @@ pub struct DetailScreen {
     /// `local_by_key` as the pass before the current one saw it: those keys are kept by
     /// [`Self::prune_keys`] so a season switch and straight back keeps every identity's key.
     prev_by_key: std::collections::HashMap<u32, u32>,
-    /// Where each card-shelf card that left the page last stood (engine key to local key), kept so
-    /// `reconcile` can put focus on the same position in that shelf; dropped if the card returns.
+    /// Where each card-shelf card or strip episode that left the page last stood (engine key to
+    /// local key), kept so `reconcile` can put focus on the same position in that shelf (an
+    /// episode: the nearest loaded one, on the same row); dropped if it returns.
     /// Not logical state: it is a projection of past publications, like the two maps above.
     gone: std::collections::HashMap<u32, u32>,
     return_pending: bool,
@@ -278,7 +279,18 @@ pub struct DetailScreen {
     // Render state.
     scroll: Spring,
     scroll_target: f32,
+    /// **The page is where the pointer put it.** Set by a wheel (the pointer's edge glide) and by a
+    /// hover, which moves focus but never the page; cleared by a key's move and by a click. While
+    /// set, a landing (a season's episodes, a shelf's next page, the cast, the ratings) does not
+    /// bring the page back to the focused section: on a series page the shelves land AS the glide
+    /// reaches them, and each landing snapped the page back (the page jumped around under it).
+    /// Not in the canon: what it decides is `scroll_target`, which is.
+    free: bool,
     episode_scroll: Spring,
+    /// The episode strip is where the pointer's sideways glide put it (`InputKind::Pan`): the tick
+    /// stops steering it to the focused episode until a key's move or a click. Like `free`, not in
+    /// the canon (what it decides, `episode_scroll`, is).
+    episode_free: bool,
     /// What the episode strip last asked the store to have loaded, and when.
     ep_want: EpWant,
     /// Where the page itself last seated the two strips, and whether the viewer has taken them
@@ -298,8 +310,8 @@ pub struct DetailScreen {
     cast: Shelf,
     tabs: TabStrip,
     season_pop: CtlPop<1>,
-    ctl_pop: CtlPop<5>,
-    disc_unfurl: [Spring; 3],
+    ctl_pop: CtlPop<{ hero::MAX_CTLS }>,
+    disc_unfurl: [Spring; hero::DISCS],
     /// The bookmark disc: what the app last said of the title's membership, the flip toward its
     /// face ([`plx_appkit::watchlist_disc::flip_frame`]) and a pending press, all the shared
     /// [`plx_appkit::watchlist_disc::Disc`]'s. Render and input state only (never hashed): the
@@ -311,10 +323,12 @@ pub struct DetailScreen {
     about_rows: about::Rows,
     /// The page's own keyed ground. Deliberately a bare [`AmbientWash`] and not the shared
     /// `PageGround`, which is the browsing screens' policy: that type draws itself whenever it is
-    /// not flat and dithers unconditionally, and both are wrong here. This wash must not be laid
-    /// over a live video plane at all ([`keyed_ground_over_plane`]), which is a per-frame answer
-    /// `PageGround` does not offer and should not. (Its dither is not a question: every wash
-    /// dithers, the photograph sliding over it included — `gfx::draw_ambient`.)
+    /// not flat and dithers any gradient unconditionally, and both are wrong here. This wash must
+    /// not be laid over a live video plane at all ([`keyed_ground_over_plane`]), which is a
+    /// per-frame answer `PageGround` does not offer and should not. (Its dither is not a question:
+    /// every wash with a gradient dithers, the photograph sliding over it included —
+    /// `gfx::draw_ambient`; a wash on four equal codes has none to band and is drawn as a clear of
+    /// its box instead.)
     ground: AmbientWash,
     /// The catalog row for this item, captured ONCE at [`new`](Self::new) — the same
     /// construction-time-only snapshot [`ground`](Self::ground)'s blur envelope takes. This is a
@@ -563,7 +577,9 @@ impl DetailScreen {
             withdrawn: false,
             scroll: Spring::at(0.0),
             scroll_target: 0.0,
+            free: false,
             episode_scroll: Spring::at(0.0),
+            episode_free: false,
             tab_scroll: Spring::at(0.0),
             episode_cells: episodes::Cells::new(),
             ep_want: EpWant::default(),
@@ -577,7 +593,7 @@ impl DetailScreen {
             tabs: TabStrip::new(),
             season_pop: CtlPop::new(),
             ctl_pop: CtlPop::new(),
-            disc_unfurl: [Spring::at(0.0); 3],
+            disc_unfurl: [Spring::at(0.0); hero::DISCS],
             watchlist: plx_appkit::watchlist_disc::Disc::new(plx_data::catalog::Membership::Unknown),
             watchlist_hex: None,
             season_metrics: season::Metrics::new(),
@@ -612,7 +628,12 @@ impl DetailScreen {
             self.keys.iter().map(|key| key.elem).max().and_then(|n| n.checked_add(1)).unwrap_or(FIRST_ITEM_ELEM));
         let newer_restore = self.restore_intent.take()
             .filter(|_| self.refresh != DetailRefreshPhase::None);
+        // A covered live body keeps the scroll it was left at: `restore` sends a page to the top,
+        // and `reveal_focus` holds off while the return waits, so the page would run to the top
+        // and back once the re-read lands. A rebuilt body starts at 0 anyway.
+        let scroll_target = self.scroll_target;
         self.restore(&memory.spot, meta);
+        self.scroll_target = scroll_target;
         if let Some(newer_restore) = newer_restore {
             // The entry memory is the request-time navigation snapshot. A ViewState completion
             // delivered while covered is newer and carries the episode whose write just settled.
@@ -750,17 +771,19 @@ impl DetailScreen {
         cx.focus.current.iter().map(|key| key.elem).chain(cx.focus.remembered.iter().map(|(_, elem)| *elem)).collect()
     }
 
-    /// Whether `local` is a card on one of the four card shelves (Related, Collection, Extras, Cast).
+    /// Whether `local` is a card on one of the four card shelves (Related, Collection, Extras,
+    /// Cast) or an episode of the strip: the cells [`Self::shelf_recovery`] re-seats.
     fn card_shelf_of(local: u32) -> bool {
         matches!(
             Self::locate_local(local, false),
-            Some(Located::Related(_) | Located::Collection(_) | Located::Extras(_) | Located::Cast(_))
+            Some(Located::Related(_) | Located::Collection(_) | Located::Extras(_) | Located::Cast(_) | Located::Episode(..))
         )
     }
 
     /// The shared recovery rule for a card shelf's focused card that is no longer there: the slot it
-    /// held, clamped to the shelf's new length. `None` for any other element, and for a shelf that
-    /// is now empty or gone, which fall to the page's own fallback.
+    /// held, clamped to the shelf's new length (an episode: the nearest loaded one, on the same
+    /// row). `None` for any other element, and for a shelf that is now empty or gone, which fall
+    /// to the page's own fallback.
     fn shelf_recovery(&self, elem: u32, meta: plx_data::metadata::MetadataView<'_>) -> Option<u32> {
         let d = self.detail(meta)?;
         let local = match Self::locate_local(*self.gone.get(&elem)?, false)? {
@@ -768,6 +791,7 @@ impl DetailScreen {
             Located::Collection(i) => collection::elem(ui_cards::clamp_slot(i, collection::len(d))?),
             Located::Extras(i) => extras::elem(ui_cards::clamp_slot(i, extras::len(d))?),
             Located::Cast(i) => cast::elem(ui_cards::clamp_slot(i, d.credits_len())?),
+            Located::Episode(i, row) => episodes::elem(d.episodes.nearest_loaded(i)?, row),
             _ => None,
         }?;
         self.engine_key(local)
@@ -2098,7 +2122,12 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                     }
                 }
                 self.pump_restore(meta, fx);
-                self.reveal_focus(cx.focus.current, cx.measure, meta);
+                if self.free {
+                    // the page stays where the pointer put it, inside what the landing left
+                    self.scroll_target = self.scroll_target.clamp(0.0, self.max_scroll(meta, cx.measure));
+                } else {
+                    self.reveal_focus(cx.focus.current, cx.measure, meta);
+                }
                 fx.invalidate(Provenance::Landing(fx.from()));
                 Handled::Yes
             }
@@ -2108,7 +2137,15 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                     self.return_pending = false;
                     self.restore_intent = None;
                 }
-                self.reveal_focus(Some(*to), cx.measure, meta);
+                // A hover moves focus, never the page: the pointer scrolls by the screen's edges
+                // (and a click by what it clicked, `Input`'s `Click` arm).
+                if *by == By::Pointer {
+                    self.free = true;
+                } else {
+                    self.free = false;
+                    self.episode_free = false;
+                    self.reveal_focus(Some(*to), cx.measure, meta);
+                }
                 if let Some(located) = self.locate(to.elem, meta) {
                     if let Located::Season(i) = located {
                         if matches!(by, By::Dir | By::Pointer) {
@@ -2180,6 +2217,40 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
                 if matches!(input.kind, InputKind::Key { key: Key::Up | Key::Down | Key::Left | Key::Right, edge: Edge::Down, .. }) {
                     self.restore_intent = None;
                     self.return_pending = false;
+                }
+                // A click brings the page to what it clicked, the way a key's move does.
+                if let InputKind::Click { hit: Some(hit), .. } = input.kind {
+                    if !self.full_trailer() {
+                        self.free = false;
+                        self.episode_free = false;
+                        self.reveal_focus(Some(FocusKey { entry: self.entry, elem: hit }), cx.measure, meta);
+                        fx.invalidate(Provenance::Input);
+                    }
+                }
+                // The pointer's sideways glide moves the row under it: one of the four shelves, or
+                // the episode strip, each left where it put it until a key's move or a click.
+                if let InputKind::Pan { dx, y, .. } = input.kind {
+                    if dx.is_finite() && !self.full_trailer() {
+                        self.pan_row(dx, y, meta, cx.measure);
+                        fx.invalidate(Provenance::Input);
+                    }
+                    return Handled::Yes;
+                }
+                // A wheel (and the pointer's edge glide, a fractional one) moves the page itself,
+                // focus staying where it is, as the Library's does: `dy` rows of `ROW_PITCH`, up
+                // to the scroll the last section's reveal takes.
+                if let InputKind::Wheel { dy } = input.kind {
+                    if !dy.is_finite() || self.full_trailer() {
+                        return Handled::Yes;
+                    }
+                    self.restore_intent = None;
+                    self.return_pending = false;
+                    self.free = true;
+                    let max = self.max_scroll(meta, cx.measure);
+                    let to = self.scroll_target - dy * plx_ui::consts::ROW_PITCH;
+                    self.scroll_target = if dy > 0.0 { to.max(0.0) } else { to.min(max.max(self.scroll_target)) };
+                    fx.invalidate(Provenance::Input);
+                    return Handled::Yes;
                 }
                 if matches!(
                     input.kind,
@@ -2288,6 +2359,12 @@ impl<H: ContentLike + crate::registry::MetadataLike> Machine<H> for DetailScreen
             // performs the navigation, exactly as it did while the panel reported an `Action`.
             ScreenEvent::App(AppMsg::AltSourceOpen(arg)) => {
                 self.content(fx, ContentReq::Present(arg.clone()));
+                Handled::Yes
+            }
+            // The *Play Version* surface committed a row: this page plays that version as its
+            // Play pill would.
+            ScreenEvent::App(AppMsg::PlayVersion(media)) => {
+                self.play_hero(false, Some(*media), fx, H::metadata(cx));
                 Handled::Yes
             }
             // Dismissed: the page under this surface has just been entered again, and it decided
@@ -2414,6 +2491,7 @@ impl<H: ContentLike + crate::registry::MetadataLike> Screen<H> for DetailScreen 
     fn redraw_focused(&self, f: &mut DrawFrame<'_, '_, H>, focus: Option<plx_machine::machine::FocusKey<u32>>) {
         DetailScreen::redraw_focused::<H>(self, f, focus)
     }
+    fn glides(&self) -> bool { true }
     fn name(&self) -> &'static str {
         "detail"
     }
@@ -3028,6 +3106,7 @@ impl DetailScreen {
                         hero::HeroCtl::MarkUnwatched => plx_ui::icons::Icon::Minus,
                         // At either rest the plain face; only a flip in flight layers the fill.
                         hero::HeroCtl::Watchlist => plx_appkit::watchlist_disc::paint(self.watchlist.pos()).0,
+                        hero::HeroCtl::Version => hero::VERSION_ICON,
                         _ => unreachable!(),
                     };
                     let mut button = CircleButton::new(c"".as_ptr())
@@ -3291,31 +3370,7 @@ mod rating_scale_tests {
 }
 
 fn rating_mark(art: plx_data::metadata::RatingArt) -> &'static [plx_ui::widgets::MarkLayer] {
-    use plx_data::metadata::RatingArt as A;
-    use plx_ui::icons::Icon;
-    use plx_ui::widgets::MarkLayer;
-    static FRESH: &[MarkLayer] = &[
-        (Icon::Tomato, theme::RATING_FRESH),
-        (Icon::TomatoCalyx, theme::RATING_LEAF),
-    ];
-    static CERTIFIED: &[MarkLayer] = &[
-        (Icon::Tomato, theme::RATING_CERTIFIED),
-        (Icon::TomatoCalyx, theme::RATING_LEAF),
-    ];
-    static ROTTEN: &[MarkLayer] = &[
-        (Icon::TomatoHollow, theme::RATING_MUTED),
-        (Icon::TomatoCalyx, theme::RATING_MUTED),
-    ];
-    static CROWD_UP: &[MarkLayer] = &[(Icon::Crowd, theme::RATING_AUDIENCE)];
-    static CROWD_DOWN: &[MarkLayer] = &[(Icon::Crowd, theme::RATING_MUTED)];
-    match art {
-        A::TomatoFresh => FRESH,
-        A::TomatoCertified => CERTIFIED,
-        A::TomatoRotten => ROTTEN,
-        A::PopcornUpright => CROWD_UP,
-        A::PopcornSpilled => CROWD_DOWN,
-        A::Imdb | A::Tmdb => &[],
-    }
+    crate::registry::captions::rating_mark(art)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3473,6 +3528,49 @@ impl DetailScreen {
         self.scroll_target = self.reveal_target(located.section(), detail, measure);
     }
 
+    /// **The pointer's sideways glide over the page** (`InputKind::Pan`): the section drawn at
+    /// screen `y` moves by `dx` px if it is a row (Related, a collection, Extras, Cast or the
+    /// episode strip).
+    fn pan_row(&mut self, dx: f32, y: f32, meta: plx_data::metadata::MetadataView<'_>, measure: &dyn plx_machine::machine::Measure) {
+        use section::SectionId;
+        let Some(d) = self.detail(meta) else { return };
+        let (sections, n) = self.sections(Some(d));
+        let Some(sec) = sections[..n].iter().copied().find(|&sec| {
+            let top = self.section_top(sec, d, measure) - self.scroll.pos;
+            y >= top && y < top + self.block_h(sec, d, measure)
+        }) else { return };
+        let which = if sec == SectionId::Related.raw() { Some(cards::Which::Related) }
+            else if sec == SectionId::Collections.raw() { Some(cards::Which::Collection) }
+            else if sec == SectionId::Extras.raw() { Some(cards::Which::Extras) }
+            else if sec == SectionId::Cast.raw() { Some(cards::Which::Cast) }
+            else { None };
+        if let Some(which) = which {
+            let len = Self::cards_of(&self.key_by_local, &self.local_by_key, which, d).count();
+            let shelf = match which {
+                cards::Which::Related => &mut self.related,
+                cards::Which::Collection => &mut self.collection,
+                cards::Which::Extras => &mut self.extras,
+                cards::Which::Cast => &mut self.cast,
+            };
+            shelf.glide(dx, len);
+        } else if sec == SectionId::Episode.raw() {
+            let len = d.episodes.len();
+            let viewport = plx_ui::consts::SCR_W - 2.0 * plx_ui::consts::MARGIN_X;
+            let max = (len as f32 * (episodes::W + episodes::GAP) - episodes::GAP - viewport).max(0.0);
+            self.episode_scroll.jump((self.episode_scroll.pos + dx).clamp(0.0, max));
+            self.episode_free = true;
+        }
+    }
+
+    /// The furthest the page scrolls: the scroll the last section's reveal takes (what a key can
+    /// reach, and the end of a wheel's travel).
+    fn max_scroll(&self, meta: plx_data::metadata::MetadataView<'_>, measure: &dyn plx_machine::machine::Measure) -> f32 {
+        self.detail(meta).map_or(0.0, |d| {
+            let (sections, n) = self.sections(Some(d));
+            if n == 0 { 0.0 } else { self.reveal_target(sections[n - 1], d, measure) }
+        })
+    }
+
     /// The scroll that brings `section` into reading position: its top at `TOP_MARGIN`, the hero
     /// for section 0.
     ///
@@ -3525,6 +3623,10 @@ impl DetailScreen {
         if self.detail(meta).is_none() && meta.detail_request_status(self.sid, &self.rk) == Some(false) {
             self.restore_intent = None;
             self.return_pending = false;
+            // Nothing draws without a detail but the hero, which is faded out past `HERO_FADE`, and
+            // `reveal_focus` holds off without one: a body that kept its scroll through
+            // `restore_memory` would sit on the backdrop alone.
+            self.scroll_target = 0.0;
             return;
         }
         let Some(d) = self.detail(meta) else { return };
@@ -3743,7 +3845,7 @@ impl DetailScreen {
             if let Some(i) = match focused {
                 Some(Located::Episode(i, _)) => Some(i),
                 _ => None,
-            } {
+            }.filter(|_| !self.episode_free) {
                 let target = ui_cards::scroll_into_view(
                     self.episode_scroll.pos,
                     i,
@@ -3980,7 +4082,7 @@ impl DetailScreen {
         // The scrim/wedge strength: `view.field` normally (1.0 idle, `PREVIEW_FIELD` once a
         // picture is up, protecting the logo+synopsis), and NOTHING in full-trailer mode — the
         // page keeps no ink up there to protect, and the trailer's own transport brings the only
-        // scrim the state needs (`player_hud::draw_scrim`, at the bottom, under the playbar).
+        // scrim the state needs (`player_hud::classic::draw_scrim`, at the bottom, under the playbar).
         let field_target = if full_trailer { 0.0 } else { view.field };
         // The bottom base scrim goes with it, for the same reason
         // (`docs/trailer-ux-plan.md` §8.3).
@@ -4211,6 +4313,7 @@ impl DetailScreen {
         // `!hero_set().trailer` and then drive `ELEM_TRAILER` directly to prove `activate_hero`'s
         // handling stays correct even though the disc itself is never shown.)
         hero::HeroSet {
+            version: self.detail(meta).is_some_and(|d| hero_versions(d).len() >= 2),
             restart,
             trailer: false,
             alt: self.alt_available(meta),
@@ -4273,7 +4376,7 @@ impl DetailScreen {
                     .unwrap_or(episodes::Action::None);
                 match action {
                     episodes::Action::Play(i) => {
-                        self.play_episode_at(i, false, fx, meta);
+                        self.play_episode_at(i, false, None, fx, meta);
                     }
                     episodes::Action::OpenDetail(sid, rk) => {
                         self.content(fx, ContentReq::Push(ContentArg::Detail { sid, rk }))
@@ -4353,10 +4456,10 @@ impl DetailScreen {
         let measure = cx.measure;
         match ctl {
             hero::HeroCtl::Play => {
-                self.play_hero(false, fx, meta);
+                self.play_hero(false, None, fx, meta);
             }
             hero::HeroCtl::Restart => {
-                self.play_hero(true, fx, meta);
+                self.play_hero(true, None, fx, meta);
             }
             hero::HeroCtl::Trailer => {
                 // Do not touch `NowPlaying` here. Extra/Detail live in `current()`, and a
@@ -4373,10 +4476,11 @@ impl DetailScreen {
                     acodec: extra.acodec.clone(),
                     title: title.to_string(),
                     context: plx_data::metadata::TRAILER_CONTEXT.into(),
+                    version: None,
                 };
                 self.content(fx, ContentReq::Play { play, resume_ns: 0 });
             }
-            hero::HeroCtl::Alt => {
+            hero::HeroCtl::Alt | hero::HeroCtl::Version => {
                 let set = self.hero_set(meta);
                 if let Some(i) = hero::index_of(set, ctl) {
                     let widths = hero::hero_widths(
@@ -4389,13 +4493,14 @@ impl DetailScreen {
                     let mut rect = hero::hero_btn_rect_at(set, i, self.hero_chain(measure, meta).btn_y, widths);
                     rect.y -= self.scroll.pos;
                     // The ANCHOR travels on the argument, bit for bit, so the surface places
-                    // itself off the pill without the page or a static holding a `Rect` for it.
-                    self.content(
-                        fx,
-                        ContentReq::Panel(ContentPanel::AltSources {
-                            anchor: [rect.x, rect.y, rect.w, rect.h].map(f32::to_bits),
-                        }),
-                    );
+                    // itself off the control without the page or a static holding a `Rect` for it.
+                    let anchor = [rect.x, rect.y, rect.w, rect.h].map(f32::to_bits);
+                    let panel = if ctl == hero::HeroCtl::Version {
+                        ContentPanel::Versions { anchor }
+                    } else {
+                        ContentPanel::AltSources { anchor }
+                    };
+                    self.content(fx, ContentReq::Panel(panel));
                 }
             }
             // The bookmark disc: the press is the item menu's own write (`Action::WatchlistAdd` /
@@ -4435,16 +4540,25 @@ impl DetailScreen {
         }
     }
 
-    fn play_hero<H: ContentLike>(&mut self, from_start: bool, fx: &mut Effects<'_, H>, meta: plx_data::metadata::MetadataView<'_>) -> bool {
+    /// Play what the hero is about. `version` is a pick off the Play Version panel
+    /// ([`hero_versions`]): on a show page it is a version of the episode the hero plays.
+    fn play_hero<H: ContentLike>(
+        &mut self,
+        from_start: bool,
+        version: Option<plx_plex::plex::MediaId>,
+        fx: &mut Effects<'_, H>,
+        meta: plx_data::metadata::MetadataView<'_>,
+    ) -> bool {
         let Some(d) = self.detail(meta) else { return false };
         if d.is_show {
             let i = hero::hero_episode(d).and_then(|ep| d.episodes.position(&ep.rk));
             match i {
-                Some(i) => self.play_episode_at(i, from_start, fx, meta),
+                Some(i) => self.play_episode_at(i, from_start, version, fx, meta),
                 None => self.play_episode_value(
-                    hero::hero_episode(d).or_else(|| d.episodes.first()),
+                    hero_episode_played(d),
                     d,
                     from_start,
+                    version,
                     fx,
                 ),
             }
@@ -4458,8 +4572,9 @@ impl DetailScreen {
                     acodec: d.acodec.clone(),
                     title: d.title.clone(),
                     context: String::new(),
+                    version,
                 },
-                |m| PlayIntent::Movie(m.clone()),
+                |m| PlayIntent::Movie { item: m.clone(), version },
             );
             let resume_ns = play_resume_ns(from_start, d.resume_ms, d.dur_ms);
             self.content(fx, ContentReq::Play { play, resume_ns });
@@ -4471,6 +4586,7 @@ impl DetailScreen {
         &mut self,
         index: usize,
         from_start: bool,
+        version: Option<plx_plex::plex::MediaId>,
         fx: &mut Effects<'_, H>,
         meta: plx_data::metadata::MetadataView<'_>,
     ) -> bool {
@@ -4478,7 +4594,7 @@ impl DetailScreen {
             return false;
         }
         let Some(d) = self.detail(meta) else { return false };
-        self.play_episode_value(d.episodes.get(index), d, from_start, fx)
+        self.play_episode_value(d.episodes.get(index), d, from_start, version, fx)
     }
 
     fn play_episode_value<H: ContentLike>(
@@ -4486,6 +4602,7 @@ impl DetailScreen {
         episode: Option<&plx_data::metadata::Episode>,
         d: &Detail,
         from_start: bool,
+        version: Option<plx_plex::plex::MediaId>,
         fx: &mut Effects<'_, H>,
     ) -> bool {
         let Some(ep) = episode else { return false };
@@ -4534,6 +4651,7 @@ impl DetailScreen {
             acodec,
             title,
             context,
+            version,
         };
         self.content(fx, ContentReq::Play { play, resume_ns });
         true
@@ -4543,6 +4661,21 @@ impl DetailScreen {
         fx.push(Fx::App(AppFx::Content(req)));
     }
 
+}
+
+/// The episode a show page's hero Play plays: the one it is resuming, else the season's first.
+fn hero_episode_played(d: &Detail) -> Option<&plx_data::metadata::Episode> {
+    hero::hero_episode(d).or_else(|| d.episodes.first())
+}
+
+/// The versions the hero's Play chooses among, for its Play Version disc and panel: the page's
+/// own movie or episode, or on a show page the episode its Play plays.
+pub(crate) fn hero_versions(d: &Detail) -> &[plx_data::pms::MediaVersion] {
+    if d.is_show {
+        hero_episode_played(d).map_or(&[], |ep| ep.versions.as_slice())
+    } else {
+        &d.versions
+    }
 }
 
 /// A presented preview must leave the framebuffer transparent. The player route punches this
