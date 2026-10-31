@@ -926,17 +926,18 @@ pub(super) fn note_enhancement_refused(context: &str, audio: plx_plex::plex::Aud
     });
 }
 
-/// The audio lane's own stream decision off a `/decision` body (`copy`/`transcode`), if it says.
 /// FORK (RichiL10): the VIDEO lane's stream decision off a `/decision` body (`copy` on a remux
 /// that leaves the source bitstream untouched), if it says.
 pub(super) fn decision_video(mc: &plx_plex::plex::MediaContainer) -> Option<&str> {
     mc.metadata
         .first()
-        .and_then(|m| m.first_part())
+        .and_then(|m| m.decided_media())
+        .and_then(|md| md.part.first())
         .and_then(|p| p.stream.iter().find(|s| s.stream_type == 1))
         .map(|s| s.decision.as_str())
 }
 
+/// The audio lane's own stream decision off a `/decision` body (`copy`/`transcode`), if it says.
 fn decision_audio(mc: &plx_plex::plex::MediaContainer) -> Option<&str> {
     mc.metadata
         .first()
