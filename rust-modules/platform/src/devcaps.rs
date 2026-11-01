@@ -75,6 +75,11 @@ const PIPELINE_ONLY_AUDIO: &[&str] = &["opus"];
 /// every codec. A 5.1 Opus film did play through on a C5 (webOS 10.3), so this can loosen per model.
 const OPUS_AUTO_MAX_CHANNELS: u32 = 2;
 
+/// **The audio codecs every webOS TV decodes**, and so the ones no `gstcool.conf` can take away
+/// ([`apply_gst_decoders`], upstream #1096 / PR #1133); the assumed fallback states exactly them
+/// ([`Caps::assumed`]). The device table stays the authority on a set without one of them.
+pub const BASELINE_AUDIO: &[&str] = &["aac", "ac3", "eac3"];
+
 /// Audio the app DECODES ITSELF and feeds as PCM, so no row of the device table is needed: the
 /// pipeline's PCM input (`libpf`'s `audio/x-raw` caps and the `contents.pcmInfo` node) is what
 /// carries it. FLAC is the case, and ALAC and LPCM ride the same path ([`APP_DECODED`]) — libpf has no FLAC input of its own (its Load vocabulary is
@@ -425,8 +430,9 @@ fn refusal_ceiling(channels: u32) -> u32 {
 const GST_CONF: &str = "/etc/gst/gstcool.conf";
 
 /// For each audio codec the pipeline can be fed, the gst decoder elements that can decode it: LG's
-/// hardware `<codec>_audiodec` first, then the software decoders (`avdec_dca` is DTS's, which
-/// webosbrew's `dts_restore` re-ranks). Codec ids are [`audio_codec_id`]'s.
+/// hardware `<codec>_audiodec` FIRST (the one [`apply_gst_decoders`] needs listed off before it drops
+/// a codec), then the software decoders (`avdec_dca` is DTS's, which webosbrew's `dts_restore`
+/// re-ranks). Codec ids are [`audio_codec_id`]'s.
 const DECODER_ELEMENTS: &[(&str, &[&str])] = &[
     ("aac", &["aac_audiodec", "avdec_aac", "faad"]),
     ("ac3", &["ac3_audiodec", "avdec_ac3"]),
@@ -456,17 +462,19 @@ pub fn parse_gst_ranks(text: &str) -> std::collections::BTreeMap<String, i64> {
     ranks
 }
 
-/// Drop from `caps` the audio codecs that `gstcool.conf` shows **nothing can decode**, and say what
-/// happened as `(dropped, kept because the file never names a decoder for them)`.
+/// Drop from `caps` the audio codecs that `gstcool.conf` **positively lists as switched off**, and
+/// say what happened as `(dropped, kept because the file never lists their hardware decoder)`.
 ///
 /// The device table says what the hardware block can do; this file says which gst decoder elements
-/// the firmware left switched on. A codec is dropped only on positive evidence: some decoder element
-/// of it is listed and every listed one is rank 0 (the C5 whose table lists DTS has `avdec_dca=0` and
-/// no hardware `dts_audiodec`; `dts_restore` gives `avdec_dca` a rank again). A codec the file does
-/// not mention at all (Opus on a C1: `opus_audiodec` keeps its default rank) stays: no line means the
-/// default rank, not unsupported. An empty or unreadable file therefore changes nothing. The channel
-/// ceiling goes with the codec, so Force Direct Play's "DTS needs a surviving table row" rule sees
-/// the same answer.
+/// the firmware left switched on. **A missing line is never evidence**: it means the default rank.
+/// The software decoders (`avdec_*`, `faad`) sit at rank 0 in every conf read, because the pipeline
+/// uses LG's hardware elements, so they say nothing on their own (an LG B4 on webOS 10.3.1 lists only
+/// them and no `*_audiodec` line at all, and plays AAC, AC3, EAC3 and DTS: upstream #1096). A codec
+/// is dropped only when its OWN hardware element (`DECODER_ELEMENTS`' first, e.g. `dts_audiodec`) is
+/// LISTED at rank `<= 0` and every other listed element of it is `<= 0` too (so `dts_restore` giving
+/// `avdec_dca` a rank again saves DTS), and never when it is in [`BASELINE_AUDIO`]. An empty or
+/// unreadable file therefore changes nothing. The channel ceiling goes with the codec, so Force
+/// Direct Play's "DTS needs a surviving table row" rule sees the same answer.
 pub fn apply_gst_decoders(caps: &mut Caps, conf: &str) -> (Vec<&'static str>, Vec<&'static str>) {
     let ranks = parse_gst_ranks(conf);
     let (mut dropped, mut unlisted) = (Vec::new(), Vec::new());
@@ -474,10 +482,12 @@ pub fn apply_gst_decoders(caps: &mut Caps, conf: &str) -> (Vec<&'static str>, Ve
         if !caps.audio_has(codec) {
             continue;
         }
-        let listed: Vec<i64> = elements.iter().filter_map(|e| ranks.get(*e).copied()).collect();
-        if listed.is_empty() {
+        let Some(&hardware) = ranks.get(elements[0]) else {
             unlisted.push(*codec);
-        } else if listed.iter().all(|r| *r <= 0) {
+            continue;
+        };
+        let listed_off = elements.iter().filter_map(|e| ranks.get(*e)).all(|r| *r <= 0);
+        if hardware <= 0 && listed_off && !BASELINE_AUDIO.contains(codec) {
             caps.audio = caps.audio.split(',').filter(|c| *c != *codec).collect::<Vec<_>>().join(",");
             caps.audio_channels.remove(*codec);
             dropped.push(*codec);
@@ -602,7 +612,7 @@ impl Caps {
             vp9_bit_depth: 8,
             av1: false,
             av1_row: (0, 0, 0),
-            audio: "aac,ac3,eac3".to_string(),
+            audio: BASELINE_AUDIO.join(","),
             audio_channels: Default::default(),
             native_ceiling: Default::default(),
             video_ceiling: Default::default(),
@@ -1477,7 +1487,7 @@ pub fn probe() {
                 let mut c = c;
                 plx_base::eventlog::log(&format!("devcaps: table audio rows: {}", table_audio_rows(&s)));
                 c.vp9_bit_depth = vp9_bit_depth_for(crate::tv::device::info().major);
-                // Before the exclusions: a codec nothing can decode is not a candidate to limit.
+                // Before the exclusions: a codec the conf lists as switched off is not a candidate to limit.
                 let (gst_dropped, gst_unlisted) = match std::fs::read_to_string(GST_CONF) {
                     Ok(conf) => apply_gst_decoders(&mut c, &conf),
                     Err(_) => (Vec::new(), Vec::new()),
@@ -1524,7 +1534,7 @@ pub fn probe() {
         plx_base::devtrig::flag("nativeaudiolearn"),
         plx_base::devtrig::flag("nativeaudioforget"),
     );
-    // The layers in order: the table, minus gstcool.conf's no-decoder codecs (above), minus
+    // The layers in order: the table, minus the codecs gstcool.conf lists as switched off (above), minus
     // [`EXCLUSIONS`]. That is the boot snapshot, and it is final. The refusals this install learned
     // come after, from the stored record alone, at each play's start ([`start_caps`]): named or
     // proved, a refusal reaches a play only once its queued write has landed. `nativeaudiowide` skips
@@ -1990,7 +2000,7 @@ mod tests {
         // gstcool.conf drops DTS; the C1 row bounds Opus to stereo; a learned refusal then removes
         // the codec the row left (stereo Opus).
         let mut c = native_set();
-        assert_eq!(apply_gst_decoders(&mut c, &GST_C1.replace("dts_audiodec=290\n", "")).0, ["dts"]);
+        assert_eq!(apply_gst_decoders(&mut c, &GST_C1.replace("dts_audiodec=290", "dts_audiodec=0")).0, ["dts"]);
         assert_eq!(apply_exclusions(&mut c, "kisscurl-koli", false, EXCLUSIONS), ["opus<=2"]);
         let c = c.minus(&[refusal("opus", 2)], "");
         assert_eq!(c.audio, "aac,ac3,eac3,flac,alac,pcm");
@@ -2113,21 +2123,126 @@ mod tests {
     }
 
     #[test]
-    fn a_set_with_no_dts_decoder_loses_dts_and_its_forced_evidence() {
-        // The C5 shape (#899): the table lists DTS, gstcool.conf has no hardware dts_audiodec and
-        // switches avdec_dca off.
-        let conf = GST_C1.replace("dts_audiodec=290\n", "");
+    fn a_set_whose_dts_decoder_is_ranked_off_loses_dts_and_its_forced_evidence() {
+        // Positive evidence (the PR #1133 "must stay" case): the hardware dts_audiodec is LISTED at
+        // rank 0 and the software avdec_dca is off too.
+        let conf = GST_C1.replace("dts_audiodec=290", "dts_audiodec=0");
         let mut c = native_set();
-        let (dropped, _) = apply_gst_decoders(&mut c, &conf);
+        let (dropped, unlisted) = apply_gst_decoders(&mut c, &conf);
         assert_eq!(dropped, ["dts"]);
+        assert!(!unlisted.contains(&"dts"));
         assert!(!c.audio_has("dts") && !c.audio_supports("dts", 6));
         // The table row goes with it, so a rule that asks for a DTS row (Force Direct Play) agrees.
         assert!(!c.audio_channels.contains_key("dts"));
+        assert!(!c.forced_admits_dts());
         assert_eq!(c.audio, "aac,ac3,eac3,opus,flac,alac,pcm");
-        // A hardware element listed at rank 0 is the same evidence.
+    }
+
+    /// A conf that merely lacks the hardware `dts_audiodec` line is NO evidence (upstream #1096): no
+    /// line means the default rank. The rule before the fix dropped DTS here.
+    #[test]
+    fn an_absent_hardware_dts_line_is_no_evidence() {
+        let conf = GST_C1.replace("dts_audiodec=290\n", "");
+        assert!(!conf.contains("dts_audiodec"), "the fixture must lack the line");
+        let mut c = native_set();
+        let before = c.clone();
+        let (dropped, unlisted) = apply_gst_decoders(&mut c, &conf);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(unlisted, ["dts", "opus"]);
+        assert_eq!(c, before);
+        assert!(c.audio_has("dts") && c.forced_admits_dts());
+    }
+
+    /// A patched set whose hardware line is ranked off but whose software decoder has a rank again:
+    /// "every listed element is off" is false, so DTS stays.
+    #[test]
+    fn a_dts_restore_patched_set_with_the_hardware_line_off_keeps_dts() {
+        let conf = GST_C1.replace("dts_audiodec=290", "dts_audiodec=0").replace("avdec_dca=0", "avdec_dca=290");
+        let mut c = native_set();
+        let before = c.clone();
+        let (dropped, _) = apply_gst_decoders(&mut c, &conf);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(c, before);
+        assert!(c.forced_admits_dts());
+    }
+
+    /// FORK (RichiL10): the real `/etc/gst/gstcool.conf` of the user's LG B4 (2024-class set,
+    /// webOS 10.3.1, build `ponytail-papikonda`), read off the set 2026-11-01; line endings made LF,
+    /// nothing else changed (the capture starts inside the buffering section). It lists ONLY software
+    /// audio decoders, all at rank 0, and no hardware `*_audiodec` line at all; the set plays AAC,
+    /// AC3, EAC3 and DTS natively. Package 12 booted on it with
+    /// `gstcool dropped=["aac", "ac3", "eac3", "dts"] kept-unlisted=["opus"]` (upstream #1096).
+    const GST_B4: &str = "max-size-bytes=0\nmax-size-time=20000000000\nlow-percent=10\nhigh-percent=99\nring-buffer-max-size=0\n[rank]\nmpegpsdemux=310\nalsasink=0\npulsesink=0\ndecproxy=300\nmediainfo=64\nosssink=0\noss4sink=0\nomxlpcmdec=290\ndvdlpcmdec=0\nadpcmdec=256\navenc_ac3=0\navenc_eac3=0\n[sw_decoder]\navdec_mp3=0\navdec_aac=0\navdec_ac3=0\navdec_dca=0\navdec_alac=0\navdec_amrnb=0\navdec_amrwb=0\navdec_eac3=0\nwavpackdec=0\navdec_wmapro=0\navdec_wmav1=0\navdec_wmav2=0\navdec_wmavoice=0\nalawdec=0\nmulawdec=0\navdec_flac=0\nadpcmdec=256\nfaad=0\ndvdlpcmdec=0\nvorbisdec=0\n[sw_video_decoder]\navdec_h264=0\navdec_vp8=0\navdec_vp9=0\n[default_sink]\nvideo=dvovideosink\naudio=rtkalsasink\n";
+
+    /// FORK (RichiL10): the B4's real conf on the B4's real table drops nothing: every codec is kept
+    /// because the file never lists its hardware decoder. Fails on the rule before the fix, which
+    /// dropped aac, ac3, eac3 and dts (every listed element at rank 0).
+    #[test]
+    fn the_b4s_real_gstcool_conf_drops_nothing() {
+        let mut c = parse(B4).expect("the B4 table parses");
+        let before = c.clone();
+        let (dropped, unlisted) = apply_gst_decoders(&mut c, GST_B4);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(unlisted, ["aac", "ac3", "eac3", "dts", "opus"]);
+        assert_eq!(c, before);
+        assert_eq!(c.audio, "aac,ac3,eac3,dts,opus,flac,alac,pcm");
+        for (codec, ch) in [("aac", 6), ("ac3", 6), ("eac3", 8), ("dts", 6), ("dca", 6)] {
+            assert!(c.audio_supports(codec, ch), "{codec} {ch}ch direct plays");
+        }
+    }
+
+    /// FORK (RichiL10): the B4's whole boot chain as `probe` runs it (table, gstcool.conf, exclusions
+    /// for its codename, fork knobs at their defaults) keeps every fork lane of package 12: the
+    /// final audio list, DTS above the 5.1 row as its core, and the AC3 encode lane ON (the boot log's
+    /// `fork lanes dts<=6 (dts above it: core) enc ac3<=8 ...`, not `dts<=0 ... enc off`).
+    #[test]
+    fn the_b4s_boot_chain_keeps_the_fork_lanes() {
+        let mut c = parse(B4).unwrap();
+        apply_gst_decoders(&mut c, GST_B4);
+        assert!(apply_exclusions(&mut c, "ponytail-papikonda", false, EXCLUSIONS).is_empty());
+        let c = with_fork_knobs(c, None, None);
+        assert_eq!(c.audio, "aac,ac3,eac3,dts,opus,flac,alac,pcm");
+        // `fork lanes dts<=6 (dts above it: core)`
+        assert_eq!(c.audio_channels.get("dts"), Some(&6));
+        assert!(dts_over_ceiling_for(None));
+        assert!(c.audio_supports_with("dca-ma", 7, true) && c.audio_supports_with("dca", 8, true), "DTS-HD 6.1/7.1 as its core");
+        assert_eq!(c.profile_channel_limit_with("dts", false), Some(8));
+        // `enc ac3<=8 (flac,pcm 3-8ch, truehd)`: the AC3 sink row survives, so the lane is on.
+        assert_eq!(c.audio_channels.get("ac3"), Some(&6));
+        assert!(encode_lane_for(None));
+        assert_eq!(c.enc_lane_profile_codecs(true), ["truehd", "mlp"]);
+        assert_eq!(c.enc_lane_fits("truehd", 8, 48_000, true), Some(true));
+        assert_eq!(c.enc_lane_fits("flac", 8, 48_000, true), Some(true));
+        assert_eq!(c.enc_lane_fits("pcm", 6, 48_000, true), Some(true));
+        // upstream's stereo PCM path and Auto's stereo Opus are unchanged.
+        assert!(c.audio_supports_lanes("flac", 2, 96_000, true, true));
+        assert!(c.audio_supports("opus", 2) && !c.audio_supports("opus", 6));
+    }
+
+    /// The floor: even where the hardware elements ARE listed at rank 0 (and the software ones too),
+    /// the codecs every webOS TV decodes stay. DTS, outside the baseline, goes on the same evidence.
+    /// `eac3` shares `ac3_audiodec` with `ac3`.
+    #[test]
+    fn the_baseline_codecs_survive_an_explicit_hardware_zero() {
+        let conf = "[rank]\naac_audiodec=0\nac3_audiodec=0\ndts_audiodec=0\n\n[sw_decoder]\navdec_aac=0\navdec_ac3=0\navdec_eac3=0\navdec_dca=0\nfaad=0\n";
+        let mut c = native_set();
+        let (dropped, _) = apply_gst_decoders(&mut c, conf);
+        for codec in BASELINE_AUDIO {
+            assert!(c.audio_has(codec), "{codec}");
+        }
+        assert_eq!(dropped, ["dts"]);
+        assert!(!c.audio_has("dts") && !c.forced_admits_dts());
+        // A conf with every hardware element off cannot take the baseline away either.
         let mut d = native_set();
-        let off = GST_C1.replace("dts_audiodec=290", "dts_audiodec=0");
-        assert_eq!(apply_gst_decoders(&mut d, &off).0, ["dts"]);
+        apply_gst_decoders(&mut d, &GST_C1.replace("=290", "=0"));
+        for codec in BASELINE_AUDIO {
+            assert!(d.audio_has(codec), "every hardware element off: {codec}");
+        }
+    }
+
+    #[test]
+    fn baseline_audio_is_the_one_list() {
+        assert_eq!(Caps::assumed().audio, BASELINE_AUDIO.join(","));
     }
 
     #[test]
@@ -2166,9 +2281,14 @@ mod tests {
         let conf = "[rank]\naac_audiodec=0\n[sw_decoder]\navdec_aac=250\nopusdec=0\n";
         let mut c = native_set();
         let (dropped, unlisted) = apply_gst_decoders(&mut c, conf);
-        assert_eq!(dropped, ["opus"]);
-        assert!(c.audio_has("aac") && !c.audio_has("opus"));
-        assert!(unlisted.contains(&"dts"));
+        // A software opusdec at 0 is no evidence: only the hardware opus_audiodec listed off is.
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert!(c.audio_has("aac") && c.audio_has("opus"));
+        assert!(unlisted.contains(&"dts") && unlisted.contains(&"opus"));
+        let mut d = native_set();
+        let (dropped, _) = apply_gst_decoders(&mut d, "[rank]\nopus_audiodec=0\n[sw_decoder]\nopusdec=0\n");
+        assert_eq!(dropped, ["opus"], "the hardware element listed off is evidence");
+        assert!(!d.audio_has("opus"));
     }
 
     /// PMS names DTS `dca` (every DTS entry in the profiles shipped with PMS spells it so); the

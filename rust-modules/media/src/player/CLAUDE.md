@@ -333,8 +333,10 @@ something.
   (2-arg calls corrupt memory / segfault).
 - **Opus goes to LG's own decoder only as far as the set is known to take it** (`ff_native_audio.rs`,
   `devcaps.rs`). What a set announces is layered, in this order and logged at boot as `devcaps: ...
-  audio layers:`: the codec table, minus the codecs `/etc/gst/gstcool.conf` shows nothing can decode
-  (`apply_gst_decoders`), minus `devcaps::EXCLUSIONS` (rows per firmware codename, each carrying its
+  audio layers:`: the codec table, minus the codecs `/etc/gst/gstcool.conf` positively lists as switched
+  off (`apply_gst_decoders`: only when the codec's OWN hardware `*_audiodec` line is listed at rank <= 0
+  and every other listed element of it is too; a missing line is never evidence, and
+  `devcaps::BASELINE_AUDIO` = aac, ac3, eac3 is never dropped by it, #1096), minus `devcaps::EXCLUSIONS` (rows per firmware codename, each carrying its
   evidence: the C1's `kisscurl-koli` limits Opus to stereo, and records that Vorbis is refused),
   minus the refusals this install learned. Auto's own stereo ceiling for Opus
   (`OPUS_AUTO_MAX_CHANNELS`) stays as it is; the rows add a ceiling Force Direct Play also holds
